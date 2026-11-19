@@ -18,3 +18,6 @@ subprocess.run([out/'flick-check'],check=True)
 
 subprocess.run(['cc','-std=c11','-O2','-Wall','-Wextra','-Werror','-I'+str(root/'include'),root/'tests/crosshair_host.c','-o',out/'crosshair-check'],check=True)
 subprocess.run([out/'crosshair-check'],check=True)
+
+subprocess.run(["g++","-std=c++20","-O2","-Wall","-Wextra","-Werror","-I"+str(root/"include"),root/"tests/crosshair_sdf_host.cpp","-o",out/"crosshair-sdf-check"],check=True)
+subprocess.run([out/"crosshair-sdf-check"],check=True)

@@ -1,4 +1,4 @@
-Perfect Engine Launcher 0.2.4
+Perfect Engine Launcher 0.2.4-r1
 
 Copy the 3ds folder to the root of your SD card. Place your own legally
 backed-up US Rev 1 Perfect Dark ROM at:

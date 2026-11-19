@@ -18,7 +18,7 @@ static unsigned merged_draws,material_hits,material_builds;
 #include "../../vendor/eog-pica/src/gfx_pica.cpp"
 #endif
 struct RecordedState {
- C3D_TexEnv env[6];uintptr_t textures[3];u32 texture_params[3];u32 viewport[4],scissor[4];
+ C3D_TexEnv env[6];uintptr_t textures[3];u32 texture_params[3],texture_width[3],texture_height[3];u32 viewport[4],scissor[4];
  unsigned blend_eq,blend_src,blend_dst;
  uintptr_t target;unsigned depth_compare;bool depth,blend,alpha;int alpha_ref;float depth_scale,depth_bias;unsigned buffer_rgb,buffer_alpha;
 };
@@ -29,7 +29,7 @@ static void *driver_vertices;
 static std::map<const C3D_BufInfo *,const void *> driver_buffers;
 static bool driver_current_backend;
 static unsigned depth_splits,split_vertex_count;
-static unsigned custom_reticle_vertices;
+static unsigned custom_reticle_vertices,smooth_reticle_vertices;
 extern "C" int pd_bottom_menu_geometry(float *) __attribute__((weak));
 static unsigned background_submissions,native_menu_frames,bottom_preview_vertices,preview_fits,retained_panel_frames,frame_bottom_start;
 static unsigned preview_geometry_vertices;
@@ -102,7 +102,7 @@ u16 C3D_BoolUnifs[2];bool C3D_BoolUnifsDirty[2];
 C3D_TexEnv *C3D_GetTexEnv(int index){return &driver.env[index];}
 void C3D_SetTexEnv(int index,C3D_TexEnv *env){driver.env[index]=*env;}
 void C3D_TexEnvBufUpdate(int mode,int mask){if(mode&C3D_RGB)driver.buffer_rgb=mask;if(mode&C3D_Alpha)driver.buffer_alpha=mask;}
-void C3D_TexBind(int unit,C3D_Tex *tex){driver.textures[unit]=(uintptr_t)tex->data;driver.texture_params[unit]=tex->param;}
+void C3D_TexBind(int unit,C3D_Tex *tex){driver.textures[unit]=(uintptr_t)tex->data;driver.texture_params[unit]=tex->param;driver.texture_width[unit]=tex->width;driver.texture_height[unit]=tex->height;}
 void C3D_CullFace(GPU_CULLMODE mode){driver_cull=mode;}
 void C3D_BindProgram(shaderProgram_s *p){driver_program=p;}
 void C3D_AlphaTest(bool enabled,GPU_TESTFUNC,int ref){driver.alpha=enabled;driver.alpha_ref=ref;}
@@ -228,6 +228,10 @@ static void record_vertex(int i) {
      unsigned src=((channel?env.srcAlpha:env.srcRgb)>>(arg*4))&15;
      if(src>=GPU_TEXTURE0 && src<=GPU_TEXTURE2)out.used_uv|=1u<<(src-GPU_TEXTURE0);
    }
+   if(reticle_scope && !pd_bottom_output && (out.used_uv&1) && driver.texture_width[0]==64 && driver.texture_height[0]==64){
+    assert((driver.texture_params[0]&GPU_TEXTURE_MAG_FILTER(GPU_LINEAR))!=0);
+    smooth_reticle_vertices++;
+   }
    recorded.push_back(out);
 }
 void C3D_DrawArrays(GPU_Primitive_t,int first,int count) {
@@ -295,7 +299,7 @@ static void check_pd_adaptive_depth(){
 }
 static void host_init(){
  clip_stereo_uniform=world_stereo_uniform=4;world_matrix_uniform=5;
- atexit([]{if(getenv("PD_PROBE_CUSTOM")){fprintf(stderr,"CUSTOM_RETICLE vertices=%u\n",custom_reticle_vertices);assert(custom_reticle_vertices>100);}assert(!native_top_rect_scope);if(getenv("PD_PROBE_UI") || getenv("PD_PROBE_KEYBOARD")){assert(native_top_background_vertices>1000);fprintf(stderr,"NATIVE_TOP_BACKGROUND vertices=%u\n",native_top_background_vertices);}if(getenv("PD_PROBE_UI") || getenv("PD_PROBE_KEYBOARD")){assert(native_top_rects>1000);fprintf(stderr,"NATIVE_TOP_PIXEL_RECTS one-to-one=%u width=%u\n",native_top_rects,native_top_width);}
+ atexit([]{if(getenv("PD_PROBE_CUSTOM")){fprintf(stderr,"CUSTOM_RETICLE vertices=%u\n",custom_reticle_vertices);assert(custom_reticle_vertices>100);fprintf(stderr,"SMOOTH_RETICLE textured_vertices=%u\n",smooth_reticle_vertices);assert(smooth_reticle_vertices>100);}assert(!native_top_rect_scope);if(getenv("PD_PROBE_UI") || getenv("PD_PROBE_KEYBOARD")){assert(native_top_background_vertices>1000);fprintf(stderr,"NATIVE_TOP_BACKGROUND vertices=%u\n",native_top_background_vertices);}if(getenv("PD_PROBE_UI") || getenv("PD_PROBE_KEYBOARD")){assert(native_top_rects>1000);fprintf(stderr,"NATIVE_TOP_PIXEL_RECTS one-to-one=%u width=%u\n",native_top_rects,native_top_width);}
  fprintf(stderr,"PICA_PROBE gpu_vertices_checked=%llu indexed_draws=%u retained_hits=%llu bottom_draws=%u bottom_vertices=%u viewmodel_triangles=%u depth_splits=%u\n",(unsigned long long)total_checked,indexed_calls,(unsigned long long)total_retained_hits,bottom_submissions,bottom_vertex_count,viewmodel_triangles,depth_splits);if(getenv("PD_PROBE_GAMEPLAY")){if(getenv("PD_PROBE_MENU_STRESS")){fprintf(stderr,"BACKGROUND_MIRROR draws=%u\n",background_submissions);assert(background_submissions==0);assert(bottom_submissions>background_submissions);assert(native_menu_frames>100);fprintf(stderr,"INDEPENDENT_NATIVE_MENU frames=%u\n",native_menu_frames);}if(getenv("PD_PROBE_INVENTORY")){fprintf(stderr,"BOTTOM_PREVIEW vertices=%u\n",bottom_preview_vertices);assert(bottom_preview_vertices>100);assert(preview_fits>100);fprintf(stderr,"CENTERED_ROTATING_PREVIEWS fits=%u\n",preview_fits);}if(getenv("PD_PROBE_PANEL_CACHE")){fprintf(stderr,"RETAINED_PANEL frames=%u\n",retained_panel_frames);assert(retained_panel_frames>500);}assert(viewmodel_triangles>1000);assert(depth_splits>0);}});
  gfx_opengl_api.init();
  vertices=static_cast<Vertex *>(calloc(MAX_VERTICES,sizeof(Vertex)));

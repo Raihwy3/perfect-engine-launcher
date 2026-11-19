@@ -17,6 +17,7 @@ slowdowns. Old 3DS models are not supported by this build.
 - Circle Pad movement and C-stick aiming, touchscreen look and optional gyro controls.
 - Stereoscopic depth for the game world, first-person weapons and supported UI.
 - Native 400×240 and centered 320×240 display modes, with 30 or 60 FPS limits.
+- Smooth custom crosshairs reworked from [Conker3DSRecomp](https://github.com/Raihwy3/Conker3DSRecomp), with adjustable colour and opacity.
 - Graphics, audio, controls and crosshair settings saved between launches.
 - Optional startup update checks, with confirmation before installation.
 

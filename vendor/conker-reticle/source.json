@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/Raihwy3/Conker3DSRecomp",
+  "source_checkout": "conker-3ds-github",
+  "revision": "f4d90cc06548c576e1246e84434106dd456cdcd6",
+  "file": "renderer/src/renderer/rt64_3ds_context.cpp",
+  "sha256": "eaf8f621d12042f5481e0f744e317b15acde43ffa98705499f15c84660ca5d72",
+  "function": "draw_reticle",
+  "license": "MIT (renderer/LICENSE)",
+  "adaptation": "Same seven SDF shapes, smoothstep coverage and 0.78 black outline. Immutable white/black masks are tinted by the game combiner; texture coordinates remain attached to the original moving aim point. No Conker game code or ROM graphics copied."
+}

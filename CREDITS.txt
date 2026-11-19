@@ -59,3 +59,10 @@ Original game content is supplied by the user's ROM. Game content and branding
 belong to their respective owners; the source licenses cover the listed code.
 
 Disclosure: AI tools were used during the development and organization of this project.
+
+Custom crosshairs
+Smooth procedural reticle shapes and outline coverage adapted from the MIT
+rt64-3ds renderer in Raihwy3's Conker: 3DS Recomp, with credit to RT64
+contributors and the Eyes of Gold implementation those shapes evolved from.
+See vendor/conker-reticle/source.json and licenses/conker-reticle.txt.
+https://github.com/Raihwy3/Conker3DSRecomp
