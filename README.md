@@ -64,12 +64,6 @@ the decoder and ROM verification; those tests need your own ROM at
 CMake build and are not part of the normal launcher build.
 
 ## Updates
-
-The launcher identifies itself as **0.2.4**. When Wi-Fi is connected, startup
-checks the latest published release at `Raihwy3/perfect-engine-launcher`.
-A newer version offers an optional install; B skips it. Network errors or a
-missing release let the game continue.
-
 Updates replace only `perfect-engine-launcher.3dsx` and its `.smdh` icon.
 The ROM, saves and settings stay in place. A new executable takes effect after
 relaunching. Create `no-update-check.flag` in the game folder to disable checks.
