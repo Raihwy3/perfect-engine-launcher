@@ -1,0 +1,113 @@
+#include "../../src/objectives_3ds.c"
+#include <assert.h>
+struct g_vars g_Vars;
+struct menu g_Menus[MAX_PLAYERS];
+s32 g_StageNum;
+struct briefing g_Briefing;
+struct missionconfig g_MissionConfig;
+u32 g_ObjectiveStatuses[MAX_OBJECTIVES];
+static u64 clock_now;
+u64 sysGetMicroseconds(void){return clock_now;}
+static int difficulty;
+s32 var8007fac4;
+u16 var8007fb3c[16]={[9]=0xff24,[15]=0xffff};
+s32 lvGetDifficulty(void){return difficulty;}
+int main(void) {
+ static struct player player;
+ static struct menudialog dialog;
+ static struct menudialogdef definition;
+ static struct menuitem items[2];
+ g_StageNum=STAGE_DEFECTION;
+ assert(!pd_bottom_objectives_visible());
+ g_Vars.currentplayer=&player;
+ clock_now=1000;assert(pd_bottom_refresh_due());
+ clock_now++;assert(!pd_bottom_refresh_due());
+ g_ObjectiveStatuses[0]=OBJECTIVE_COMPLETE;assert(pd_bottom_refresh_due());
+ clock_now++;assert(!pd_bottom_refresh_due());
+ difficulty=1;assert(pd_bottom_refresh_due());
+ g_Briefing.objectivenames[0]=123;assert(pd_bottom_refresh_due());
+ g_Briefing.objectivedifficulties[0]=1;assert(pd_bottom_refresh_due());
+ g_Menus[0].curdialog=&dialog;assert(pd_bottom_refresh_due());clock_now++;assert(pd_bottom_refresh_due());
+ g_Menus[0].curdialog=NULL;assert(pd_bottom_refresh_due());
+ clock_now++;assert(!pd_bottom_refresh_due());
+ pd_bottom_objectives_reset();assert(pd_bottom_refresh_due());
+ difficulty=0;memset(&g_Briefing,0,sizeof g_Briefing);memset(g_ObjectiveStatuses,0,sizeof g_ObjectiveStatuses);
+ g_Vars.normmplayerisrunning=true;assert(!pd_bottom_objectives_visible() && !pd_bottom_mission_panel_visible());
+ g_Vars.normmplayerisrunning=false;assert(pd_bottom_objectives_visible());
+ g_Vars.in_cutscene=true;assert(!pd_bottom_objectives_visible());
+ assert(pd_bottom_mission_panel_visible());
+ g_Vars.in_cutscene=false;
+ g_Menus[0].curdialog=&dialog;assert(!pd_bottom_objectives_visible());
+ definition.items=items;dialog.definition=&definition;
+ items[0].type=MENUITEMTYPE_SELECTABLE;items[1].type=MENUITEMTYPE_END;
+ assert(!pd_bottom_objectives_visible());
+ items[0].type=MENUITEMTYPE_OBJECTIVES;assert(pd_bottom_objectives_visible());
+ g_StageNum=STAGE_CITRAINING;assert(!pd_bottom_objectives_visible());
+ g_StageNum=STAGE_TITLE;assert(!pd_bottom_objectives_visible());
+ int indices[8];for(unsigned i=0;i<8;i++)indices[i]=-77;
+ for(unsigned i=0;i<ARRAYCOUNT(g_Briefing.objectivenames);i++){
+  g_Briefing.objectivenames[i]=i+1;g_Briefing.objectivedifficulties[i]=1;
+ }
+ assert(pd_bottom_objective_indices(indices,6)==6);
+ for(int i=0;i<6;i++)assert(indices[i]==i);
+ assert(indices[6]==-77 && indices[7]==-77);
+ difficulty=1;assert(pd_bottom_objective_indices(indices,6)==0);difficulty=0;
+ for(unsigned i=0;i<8;i++)indices[i]=-77;
+ assert(pd_bottom_objective_indices(indices,2)==6 && indices[0]==0 && indices[1]==1 && indices[2]==-77);
+ assert(pd_bottom_objective_indices(NULL,0)==6);
+ static struct font font;static struct fontchar chars[94];static unsigned char pixels[32];
+ font.kerning[0]=1;
+ chars['A'-33].width=2;chars['A'-33].height=2;chars['A'-33].pixeldata=pixels;
+ pixels[8]=0x0f;pixels[9]=0x90;pixels[16]=0;pixels[17]=0xf0;
+ memset(canvas,0,sizeof canvas);s32 x=2,y=3;
+ pd_bottom_text(NULL,&x,&y,"A",chars,&font,0xffffffff,320,240,0,12);
+ assert(x==4 && y==3 && canvas[3*320+2]==0xffff && canvas[4*320+3]==0xffff);
+ assert(canvas[3*320+3]==rgb565(36,36,36) && canvas[4*320+2]==0);
+ /* Paragraphs must not disappear beyond the old 512-character limit. */
+ char paragraph[704];memset(paragraph,'B',700);paragraph[700]='A';paragraph[701]=0;
+ memset(canvas,0,sizeof canvas);x=2;y=3;
+ pd_bottom_text(NULL,&x,&y,paragraph,chars,&font,0xffffffff,320,240,0,12);
+ assert(canvas[3*320+2]==0xffff && x==4);
+ x=-100;y=-100;pd_bottom_text(NULL,&x,&y,"A",chars,&font,0xffffffff,320,240,0,12);
+ pd_bottom_line(NULL,-1,-1,3,2,0xff0000ff,0x0000ffff,0);
+ native_valid=1;native_dialog=&dialog;g_Menus[0].curdialog=&dialog;
+ assert(pd_bottom_menu_canvas_valid());g_Menus[0].curdialog=NULL;assert(!pd_bottom_menu_canvas_valid());g_Menus[0].curdialog=&dialog;
+ dialog.width=200;dialog.height=80;native_source_x=100;native_source_y=80;
+ native_left=60;native_top=80;native_scale=1;native_width=200;native_height=80;
+ native_hit_count=0;pd_bottom_native_capturing=1;
+ struct menurendercontext ctx={0};ctx.x=110;ctx.y=110;ctx.width=150;ctx.item=&items[0];
+ pd_bottom_native_hit(&ctx,-1,110,12);pd_bottom_native_capturing=0;
+ assert(pd_bottom_native_touch(35,43)==1 && dialog.focuseditem==&items[0]);
+ assert(pd_bottom_native_touch(100,14)==2);
+ assert(pd_bottom_native_touch(5,80)==3 && pd_bottom_native_touch(315,80)==4);
+ assert(pd_bottom_native_touch(100,210)==0);
+ native_map=1;memset(canvas,0,sizeof canvas);pixel(110,110,0xffffffff,255);
+ assert(canvas[110*320+70]==0xffff);native_map=0;native_valid=0;
+ pd_bottom_frame_mapping(320,220);frame_copy_mode=1;native_valid=1;native_width=dialog.width;native_height=dialog.height;
+ assert(pd_bottom_frame_token()==(uintptr_t)&dialog);
+ assert(pd_bottom_native_touch(35,43)==1);
+ assert(pd_bottom_native_touch(34,14)==2);
+ assert(pd_bottom_native_touch(319,80)==4);
+ int bounds[4];assert(pd_bottom_frame_bounds(bounds));
+ assert(bounds[0]==134 && bounds[1]==100 && bounds[2]==352 && bounds[3]==174);
+ frame_copy_mode=0;native_valid=0;
+ native_width=200;native_height=80;native_context_valid=0;
+ int dx,dy,dw,dh;
+ pd_bottom_layout_rect(native_source_x,native_source_y+13,200,12,&dx,&dy,&dw,&dh);
+ assert(dx==12 && dy==22 && dw==296 && dh==12);
+ pd_bottom_layout_rect(native_source_x+100,native_source_y+33,1,12,&dx,&dy,&dw,&dh);
+ assert(dx==160 && dy==42 && dw==1 && dh==12);
+ native_height=40;
+ pd_bottom_layout_rect(native_source_x,native_source_y+33,200,12,&dx,&dy,&dw,&dh);
+ assert(dy==42 && dh==12); /* Short dialogs never stretch rows over the LCD. */
+ pd_bottom_ui_drawing=1;
+ pd_bottom_layout_rect(24,35,270,12,&dx,&dy,&dw,&dh);
+ assert(dx==24 && dy==35 && dw==270 && dh==12);
+ pd_bottom_ui_drawing=0;
+ puts("PASS independent 320x240 content layout: full-width columns, native glyph/line sizes, bounded row spacing");
+ puts("PASS captured menu projection and touch mapping");
+ puts("PASS native dialog coordinate mapping, row hit targets, title back and side tabs");
+ puts("PASS software glyph CI4 stride/border, palette alpha, kerning advance, pixel blend, line clipping and offscreen text");
+ puts("PASS six-slot briefing bounds, difficulty filtering and output canaries");
+ puts("PASS bottom objectives visibility: mission, cutscene, objective pause page, other dialogs, CI and title");
+}

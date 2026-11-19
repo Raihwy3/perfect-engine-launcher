@@ -1,0 +1,3446 @@
+diff --git a/port/fast3d/gfx_pc.cpp b/port/fast3d/gfx_pc.cpp
+index e0f6673..c784380 100644
+--- a/port/fast3d/gfx_pc.cpp
++++ b/port/fast3d/gfx_pc.cpp
+@@ -1,3 +1,49 @@
++#include "native_dynamic_stereo.h"
++extern "C" void native_pica_projection(float,float,float,float);
++extern "C" void native_pica_reticle(int);
++extern "C" void native_pica_sky(int);
++static bool pd_projection_valid;
++static float pd_projection_coeffs[4];
++extern "C" void native_pica_flat_scope(int);
++extern "C" void native_pica_set_viewmodel(int);
++#ifdef __3DS__
++#include <stddef.h>
++#include <stdint.h>
++#include "pd_runtime.h"
++#include "system.h"
++#include "pd_triangle_facing.h"
++extern "C" void native_pica_bottom_target(int);
++extern "C" unsigned native_pica_texture_bytes(unsigned);
++extern "C" void native_pica_texture_memory(unsigned *,unsigned *);
++extern "C" void native_pica_texture_release(unsigned);
++extern "C" void native_pica_bottom_retain(void);
++extern "C" void native_pica_menu_background(int);
++extern "C" void pd_menu_background_snapshot(void) __attribute__((weak));
++static bool pd_viewmodel_scope;
++static unsigned pd_vm_near_clamped,pd_vm_behind;
++extern "C" void pd_viewmodel_report(void){
++ sysLogPrintf(0,"Viewmodel clipping: near-crossing=%u behind-camera=%u",pd_vm_near_clamped,pd_vm_behind);
++ pd_vm_near_clamped=pd_vm_behind=0;
++}
++struct NativeGpuWorld {float rows[4][4];unsigned cull;};
++extern "C" int native_pica_gpu_world(const NativeGpuWorld *);
++extern "C" int native_pica_gpu_world_supported(void);
++extern "C" void native_pica_input_hint(unsigned,unsigned);
++extern "C" void native_pica_texture_lod(unsigned);
++extern "C" void native_pica_vertex_ids(const float *,const uint64_t *,size_t);
++extern "C" void native_pica_fog_hint(int,const float *);
++extern "C" void native_pica_frontend_ui(int);
++extern "C" int native_pica_ui_rect(int);
++extern "C" void native_pica_retained_hint(uint64_t);
++static NativeGpuWorld pd_matrices[2048];
++static unsigned pd_matrix_count,pd_gpu_tag=~0u;
++static bool pd_glass_scope;
++static unsigned pd_uniform_mask,pd_alpha_mask,pd_texture_level,pd_next_id;
++static uint64_t pd_draw_epoch;
++static uint64_t pd_vertex_ids[256*3];
++static float pd_expected_clip[256*3*4];
++extern "C" void pd_probe_vertex_reference(const float *,size_t) __attribute__((weak));
++#endif
+ #define NOMINMAX
+ 
+ #include <cmath>
+@@ -74,6 +120,9 @@ struct NormalColor {
+ };
+ 
+ struct LoadedVertex {
++#ifdef __3DS__
++ float pd_raw[3];unsigned pd_matrix,pd_id;
++#endif
+     float x, y, z, w;
+     float u, v;
+     struct RGBA color;
+@@ -250,7 +299,22 @@ static constexpr float clampf(const float x, const float min, const float max) {
+ 
+ static void gfx_flush(void) {
+     if (buf_vbo_len > 0) {
++#ifdef __3DS__
++        if(pd_gpu_tag!=~0u)native_pica_vertex_ids(buf_vbo,pd_vertex_ids,buf_vbo_num_tris*3);
++        uint64_t token=0;
++        if(pd_gpu_tag!=~0u && pd_option_get(16)){
++         token=1469598103934665603ull;
++         for(size_t i=0;i<buf_vbo_len;i++){uint32_t bits;memcpy(&bits,&buf_vbo[i],4);token=(token^bits)*1099511628211ull;}
++         if(!token)token=1;
++        }
++        native_pica_retained_hint(token);
++        if(pd_gpu_tag!=~0u && pd_probe_vertex_reference)pd_probe_vertex_reference(pd_expected_clip,buf_vbo_num_tris*3);
++        float fog[3]={rdp.fog_color.r/255.f,rdp.fog_color.g/255.f,rdp.fog_color.b/255.f};native_pica_fog_hint(1,fog);
++#endif
+         gfx_rapi->draw_triangles(buf_vbo, buf_vbo_len, buf_vbo_num_tris);
++#ifdef __3DS__
++        native_pica_vertex_ids(nullptr,nullptr,0);native_pica_retained_hint(0);++pd_draw_epoch;
++#endif
+         buf_vbo_len = 0;
+         buf_vbo_num_tris = 0;
+     }
+@@ -509,6 +573,9 @@ static struct ColorCombiner* gfx_lookup_or_create_color_combiner(const ColorComb
+ void gfx_texture_cache_clear() {
+     gfx_flush();
+     for (const auto& entry : gfx_texture_cache.map) {
++        #ifdef __3DS__
++        native_pica_texture_release(entry.second.texture_id);
++#endif
+         gfx_texture_cache.free_texture_ids.push_back(entry.second.texture_id);
+     }
+     gfx_texture_cache.map.clear();
+@@ -517,6 +584,30 @@ void gfx_texture_cache_clear() {
+     memset(rendering_state.textures, 0, sizeof(rendering_state.textures));
+ }
+ 
++#ifdef __3DS__
++/* Called by the backend after FrameBegin has waited and retired GPU data was
++ * freed, before any draw for this frame. Reclaiming allocations is safe here. */
++extern "C" void native_graphics_trim_texture_cache(void){
++ unsigned resident,free_bytes;native_pica_texture_memory(&resident,&free_bytes);
++ constexpr unsigned budget=4*1024*1024,reserve=3*1024*1024;
++ unsigned available=resident+free_bytes;
++ unsigned target=std::min(budget,available>reserve?available-reserve:0u);
++ if(resident<=target)return;
++ unsigned removed=0,before=resident;
++ gfx_flush();
++ while(resident>target && !gfx_texture_cache.lru.empty()){
++  auto it=gfx_texture_cache.lru.front().it;
++  unsigned bytes=native_pica_texture_bytes(it->second.texture_id);
++  for(unsigned unit=0;unit<2;unit++)if(rendering_state.textures[unit]==&*it){rendering_state.textures[unit]=nullptr;rdp.textures_changed[unit]=true;}
++  native_pica_texture_release(it->second.texture_id);
++  gfx_texture_cache.free_texture_ids.push_back(it->second.texture_id);
++  gfx_texture_cache.map.erase(it);gfx_texture_cache.lru.pop_front();
++  resident=bytes>resident?0:resident-bytes;removed++;
++ }
++ sysLogPrintf(0,"Texture cache trim: %u evicted; %u -> %u bytes; prior linear free=%u",removed,before,resident,free_bytes);
++}
++#endif
++
+ static bool gfx_texture_cache_lookup(int i, const TextureCacheKey& key) {
+     TextureCacheMap::iterator it = gfx_texture_cache.map.find(key);
+     TextureCacheNode** n = &rendering_state.textures[i];
+@@ -530,11 +621,24 @@ static bool gfx_texture_cache_lookup(int i, const TextureCacheKey& key) {
+     }
+ 
+     if (gfx_texture_cache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
+-        // Remove the texture that was least recently used
+-        it = gfx_texture_cache.lru.front().it;
++        // A texture can remain bound while the other unit churns the cache.
++        // Do not free its node or recycle its GPU ID until it is unbound.
++        auto victim = gfx_texture_cache.lru.begin();
++        for (; victim != gfx_texture_cache.lru.end(); ++victim) {
++            TextureCacheNode *node = &*victim->it;
++            bool bound = false;
++            for (auto *texture : rendering_state.textures) bound |= texture == node;
++            if (!bound) break;
++        }
++        // At most two entries are bound; the cache holds 1024.
++        if (victim == gfx_texture_cache.lru.end())sysFatalError("Texture cache has no unbound victim");
++        it = victim->it;
++        #ifdef __3DS__
++        native_pica_texture_release(it->second.texture_id);
++#endif
+         gfx_texture_cache.free_texture_ids.push_back(it->second.texture_id);
+         gfx_texture_cache.map.erase(it);
+-        gfx_texture_cache.lru.pop_front();
++        gfx_texture_cache.lru.erase(victim);
+     }
+ 
+     uint32_t texture_id;
+@@ -573,7 +677,10 @@ void gfx_texture_cache_delete(const uint8_t* orig_addr) {
+         for (auto it = gfx_texture_cache.map.begin(bucket); it != gfx_texture_cache.map.end(bucket); ++it) {
+             if (it->first.texture_addr == orig_addr) {
+                 gfx_texture_cache.lru.erase(it->second.lru_location);
+-                gfx_texture_cache.free_texture_ids.push_back(it->second.texture_id);
++                #ifdef __3DS__
++        native_pica_texture_release(it->second.texture_id);
++#endif
++        gfx_texture_cache.free_texture_ids.push_back(it->second.texture_id);
+                 gfx_texture_cache.map.erase(it->first);
+                 again = true;
+                 break;
+@@ -600,7 +707,10 @@ void gfx_texture_cache_delete_range(const uint8_t* start, const uint8_t* end) {
+     for (auto it = gfx_texture_cache.map.begin(); it != gfx_texture_cache.map.end(); ) {
+         if (it->first.texture_addr >= start && it->first.texture_addr < end) {
+             gfx_texture_cache.lru.erase(it->second.lru_location);
+-            gfx_texture_cache.free_texture_ids.push_back(it->second.texture_id);
++            #ifdef __3DS__
++        native_pica_texture_release(it->second.texture_id);
++#endif
++        gfx_texture_cache.free_texture_ids.push_back(it->second.texture_id);
+             it = gfx_texture_cache.map.erase(it);
+         } else {
+             ++it;
+@@ -900,6 +1010,19 @@ static void import_texture(int i, int tile, bool importReplacement) {
+         key = { orig_addr, {}, fmt, siz, palette_index };
+     }
+ 
++    // Font palettes can be rewritten in place. Addresses alone do not describe
++    // the decoded image; tile stride also changes how glyph pixels are read.
++    key.size_bytes = loaded_texture.size_bytes;
++    key.line_bytes = loaded_texture.line_size_bytes;
++    key.full_line_bytes = loaded_texture.full_image_line_size_bytes;
++    key.tile_line_bytes = rdp.texture_tile[tile].line_size_bytes;
++    if (fmt == G_IM_FMT_CI) {
++        uint32_t hash = 2166136261u;
++        unsigned first = siz == G_IM_SIZ_4b ? palette_index * 16 : 0;
++        unsigned count = siz == G_IM_SIZ_4b ? 16 : 256;
++        for (unsigned n = first; n < first + count; ++n) hash = (hash ^ rdp.palette[n]) * 16777619u;
++        key.palette_hash = hash;
++    }
+     if (gfx_texture_cache_lookup(i, key)) {
+         return;
+     }
+@@ -945,6 +1068,7 @@ static void import_texture(int i, int tile, bool importReplacement) {
+ 
+ static void gfx_normalize_vector(float v[3]) {
+     float s = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
++    if (!(s > 0.f)) { v[0] = v[1] = v[2] = 0.f; return; }
+     v[0] /= s;
+     v[1] /= s;
+     v[2] /= s;
+@@ -999,6 +1123,18 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
+ #endif
+ 
+     if (parameters & G_MTX_PROJECTION) {
++#ifdef __3DS__
++        if(parameters & G_MTX_LOAD){
++          float coeffs[]={matrix[2][2],matrix[2][3],matrix[3][2],matrix[3][3]};
++          if(native_stereo::Projection::from(coeffs[0],coeffs[1],coeffs[2],coeffs[3]).valid &&
++             fabsf(matrix[0][3])+fabsf(matrix[1][3])+fabsf(matrix[0][2])+fabsf(matrix[1][2])<.00001f &&
++             (!pd_projection_valid || memcmp(coeffs,pd_projection_coeffs,sizeof coeffs))){
++            gfx_flush();native_pica_projection(coeffs[0],coeffs[1],coeffs[2],coeffs[3]);
++            memcpy(pd_projection_coeffs,coeffs,sizeof coeffs);pd_projection_valid=true;
++          }
++        }
++#endif
++
+         if (parameters & G_MTX_LOAD) {
+             memcpy(rsp.P_matrix, matrix, sizeof(matrix));
+         } else {
+@@ -1022,6 +1158,7 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
+ }
+ 
+ static void gfx_sp_pop_matrix(uint32_t count) {
++    rsp.lights_changed = true; // Reflections must use the restored modelview.
+     while (count--) {
+         if (rsp.modelview_matrix_stack_size > 0) {
+             --rsp.modelview_matrix_stack_size;
+@@ -1053,11 +1190,27 @@ static void gfx_adjust_width_height_for_scale(uint32_t& width, uint32_t& height)
+ }
+ 
+ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx* vertices) {
++#ifdef __3DS__
++ unsigned pd_tag=~0u;
++ if(pd_option_get(13) && native_pica_gpu_world_supported()){
++  NativeGpuWorld matrix={};
++  for(unsigned col=0;col<4;col++){
++   for(unsigned row=0;row<4;row++)matrix.rows[row][col]=rsp.MP_matrix[col][row];
++   matrix.rows[0][col]=gfx_adjust_x_for_aspect_ratio(matrix.rows[0][col],matrix.rows[3][col]);
++  }
++  if(pd_matrix_count && !memcmp(pd_matrices[pd_matrix_count-1].rows,matrix.rows,sizeof matrix.rows))pd_tag=pd_matrix_count-1;
++  else if(pd_matrix_count<2048){pd_tag=pd_matrix_count++;pd_matrices[pd_tag]=matrix;}
++ }
++#endif
++
+     SUPPORT_CHECK(n_vertices <= MAX_VERTICES);
+ 
+     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
+         const Vtx* v = &vertices[i];
+         struct LoadedVertex* d = &rsp.loaded_vertices[dest_index];
++#ifdef __3DS__
++ d->pd_matrix=pd_tag;d->pd_id=++pd_next_id;if(pd_tag!=~0u)for(unsigned axis=0;axis<3;axis++)d->pd_raw[axis]=v->v[axis];
++#endif
+ 
+         float x = v->v[0] * rsp.MP_matrix[0][0] + v->v[1] * rsp.MP_matrix[1][0] + v->v[2] * rsp.MP_matrix[2][0] + rsp.MP_matrix[3][0];
+         float y = v->v[0] * rsp.MP_matrix[0][1] + v->v[1] * rsp.MP_matrix[1][1] + v->v[2] * rsp.MP_matrix[2][1] + rsp.MP_matrix[3][1];
+@@ -1104,7 +1257,11 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx* verti
+             d->color.g = g > 255 ? 255 : g;
+             d->color.b = b > 255 ? 255 : b;
+ 
+-            if (rsp.geometry_mode & G_TEXTURE_GEN) {
++            if ((rsp.geometry_mode & G_TEXTURE_GEN)
++#ifdef __3DS__
++ && !pd_glass_scope
++#endif
++ ) {
+                 float dotx = 0, doty = 0;
+                 if (rsp.lookat_enabled) {
+                     dotx += vcn->x * rsp.current_lookat_coeffs[0][0];
+@@ -1202,6 +1359,9 @@ static void gfx_sp_modify_vertex(uint16_t vtx_idx, uint8_t where, uint32_t val)
+     int16_t t = (int16_t)val;
+ 
+     struct LoadedVertex* v = &rsp.loaded_vertices[vtx_idx];
++#ifdef __3DS__
++ v->pd_id=++pd_next_id;
++#endif
+     v->u = s;
+     v->v = t;
+ }
+@@ -1219,7 +1379,11 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
+     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
+ 
+     if ((rsp.extra_geometry_mode & G_NO_CLIPPING_EXT) == 0) {
+-        if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
++        if ((v1->clip_rej & v2->clip_rej & v3->clip_rej)
++#ifdef __3DS__
++            && (!pd_viewmodel_scope || (v1->w>0 && v2->w>0 && v3->w>0) || (v1->w<=0 && v2->w<=0 && v3->w<=0))
++#endif
++        ) {
+             // The whole triangle lies outside the visible area
+             return;
+         }
+@@ -1238,6 +1402,13 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
+             cross = -cross;
+         }
+ 
++#ifdef __3DS__
++        // Limit the precision change to first-person models. World culling
++        // stays on the previously hardware-tested path.
++        if(pd_viewmodel_scope)cross=native_triangle_facing(v1->x,v1->y,v1->w,
++            v2->x,v2->y,v2->w,v3->x,v3->y,v3->w);
++#endif
++
+         // If inverted culling is requested, negate the cross
+         // if ((rsp.extra_geometry_mode & G_EX_INVERT_CULLING) == 1) {
+         //     cross = -cross;
+@@ -1292,15 +1463,34 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
+     bool use_alpha =
+         (rdp.other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20) && (rdp.other_mode_l & (3 << 16)) == (G_BL_1MA << 16);
+     const bool use_fog = ((rdp.other_mode_l >> 30) == G_BL_CLR_FOG) || ((rdp.other_mode_l >> 26) == G_BL_A_FOG);
+-    const bool texture_edge = (rdp.other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
+-    const bool use_noise = (rdp.other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_DITHER;
++    const bool texture_edge = ((rdp.other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA)
++#ifdef __3DS__
++ && !pd_glass_scope
++#endif
++ ;
++    const bool use_noise = ((rdp.other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_DITHER)
++#ifdef __3DS__
++ && !pd_glass_scope
++#endif
++ ;
+     const bool use_2cyc = (rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE;
+-    const bool alpha_threshold = (rdp.other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD;
++    const bool alpha_threshold = ((rdp.other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD)
++#ifdef __3DS__
++ && !pd_glass_scope
++#endif
++ ;
+     const bool invisible = (rdp.other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (rdp.other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
+     const bool use_grayscale = rdp.grayscale;
+     const bool use_modulate = use_alpha && (rsp.extra_geometry_mode & G_MODULATE_EXT) != 0;
+-    const bool use_blur = (rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) == G_TF_BLUR_EXT;
++    const bool use_blur = ((rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) == G_TF_BLUR_EXT)
++#ifdef __3DS__
++ && !pd_glass_scope
++#endif
++ ;
+ 
++#ifdef __3DS__
++    if(pd_glass_scope)use_alpha=true;
++#endif
+     if (texture_edge) {
+         use_alpha = true;
+     }
+@@ -1340,6 +1530,9 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
+ 
+     ColorCombinerKey key;
+     key.combine_mode = rdp.combine_mode;
++#ifdef __3DS__
++    if(pd_glass_scope){uint64_t cycle=(uint64_t(G_CCMUX_PRIMITIVE)<<13)|(uint64_t(G_ACMUX_PRIMITIVE)<<25);key.combine_mode=cycle|(cycle<<28);}
++#endif
+     key.options = cc_options;
+ 
+     ColorCombiner* comb = gfx_lookup_or_create_color_combiner(key);
+@@ -1436,17 +1629,57 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
+     gfx_rapi->shader_get_info(prg, &num_inputs, used_textures);
+ 
+     struct GfxClipParameters clip_parameters = gfx_rapi->get_clip_parameters();
++#ifdef __3DS__
++ unsigned next_tag=~0u;
++ if(!is_rect && !pd_viewmodel_scope && vtx1_idx<MAX_VERTICES && vtx2_idx<MAX_VERTICES && vtx3_idx<MAX_VERTICES &&
++    v1->pd_matrix< pd_matrix_count && v1->pd_matrix==v2->pd_matrix && v1->pd_matrix==v3->pd_matrix &&
++    v1->w>0 && v2->w>0 && v3->w>0 && (rdp.other_mode_l&Z_UPD) &&
++    !(rdp.other_mode_l&G_ZS_PRIM) && (rdp.other_mode_l&ZMODE_DEC)!=ZMODE_DEC &&
++    !(rsp.geometry_mode&G_TEXTURE_GEN) && !clip_parameters.z_is_from_0_to_1 && !clip_parameters.invert_y)
++  next_tag=v1->pd_matrix;
++ if(next_tag!=pd_gpu_tag){gfx_flush();native_pica_gpu_world(next_tag==~0u?nullptr:&pd_matrices[next_tag]);pd_gpu_tag=next_tag;}
++ unsigned uniform=0,alpha_uniform=0;
++ for(unsigned j=0;j<num_inputs;j++){
++  unsigned rgb=comb->shader_input_mapping[0][j],a=comb->shader_input_mapping[1][j];
++  if(rgb!=G_CCMUX_SHADE && rgb!=G_CCMUX_SHADE_ALPHA && rgb!=G_CCMUX_LOD_FRACTION)uniform|=1u<<j;
++  if(a!=G_ACMUX_SHADE && a!=G_CCMUX_SHADE_ALPHA && a!=G_ACMUX_LOD_FRACTION && a!=G_CCMUX_LOD_FRACTION)alpha_uniform|=1u<<j;
++ }
++ if(uniform!=pd_uniform_mask || alpha_uniform!=pd_alpha_mask){gfx_flush();native_pica_input_hint(uniform,alpha_uniform);pd_uniform_mask=uniform;pd_alpha_mask=alpha_uniform;}
++ unsigned level=0;
++ if(!is_rect && !pd_viewmodel_scope && pd_option_get(1) && std::min(v1->w,std::min(v2->w,v3->w))>1000.f)level=std::min(3u,unsigned(pd_option_get(1)));
++ if(level!=pd_texture_level){gfx_flush();native_pica_texture_lod(level);pd_texture_level=level;}
++#endif
++
+ 
+     for (int i = 0; i < 3; i++) {
++#ifdef __3DS__
++        pd_vertex_ids[buf_vbo_num_tris*3+i]=(pd_draw_epoch<<32)|v_arr[i]->pd_id;
++        if(pd_gpu_tag!=~0u && pd_probe_vertex_reference){float *expected=pd_expected_clip+(buf_vbo_num_tris*3+i)*4;expected[0]=v_arr[i]->x;expected[1]=v_arr[i]->y;expected[2]=v_arr[i]->z;expected[3]=v_arr[i]->w;}
++#endif
+         float z = v_arr[i]->z, w = v_arr[i]->w;
++#ifdef __3DS__
++        // Count foreground near crossings without distorting model depth.
++        if(pd_viewmodel_scope){
++            if(w>0 && z < -w)pd_vm_near_clamped++;
++            else if(w<=0)pd_vm_behind++;
++        }
++#endif
+         if (clip_parameters.z_is_from_0_to_1) {
+             z = (z + w) / 2.0f;
+         }
+ 
++#ifdef __3DS__
++        if(pd_gpu_tag!=~0u){
++         for(unsigned axis=0;axis<3;axis++)buf_vbo[buf_vbo_len++]=v_arr[i]->pd_raw[axis];
++         buf_vbo[buf_vbo_len++]=1.f;
++        }else
++#endif
++        {
+         buf_vbo[buf_vbo_len++] = v_arr[i]->x;
+         buf_vbo[buf_vbo_len++] = clip_parameters.invert_y ? -v_arr[i]->y : v_arr[i]->y;
+         buf_vbo[buf_vbo_len++] = z;
+         buf_vbo[buf_vbo_len++] = w;
++        }
+ 
+         for (int t = 0; t < 2; t++) {
+             if (!used_textures[t]) {
+@@ -1529,6 +1762,9 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
+                         // (except LOD fraction).
+                     case G_CCMUX_PRIMITIVE:
+                         color = &rdp.prim_color;
++#ifdef __3DS__
++                        if(pd_glass_scope){tmp.r=tmp.g=tmp.b=18;tmp.a=96;color=&tmp;}
++#endif
+                         break;
+                     case G_CCMUX_SHADE:
+                         color = &v_arr[i]->color;
+@@ -1542,6 +1778,9 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
+                         break;
+                     case G_CCMUX_PRIMITIVE_ALPHA: {
+                         tmp.r = tmp.g = tmp.b = rdp.prim_color.a;
++#ifdef __3DS__
++                        if(pd_glass_scope)tmp.r=tmp.g=tmp.b=96;
++#endif
+                         color = &tmp;
+                         break;
+                     }
+@@ -1719,7 +1958,7 @@ static void gfx_sp_movemem(uint8_t index, uint8_t offset, const void* data) {
+             // I think this is only really used for guLookAtReflect
+             index = !((index - G_MV_LOOKATY) / 2);
+             rsp.lookat[index] = ((const Light *)data)->l;
+-            rsp.lookat_enabled = (index == 0) || (rsp.lookat[1].dir[0] || rsp.lookat[1].dir[1]);
++            rsp.lookat_enabled = (index == 0) || (rsp.lookat[1].dir[0] || rsp.lookat[1].dir[1] || rsp.lookat[1].dir[2]);
+             rsp.lights_changed = true;
+             break;
+         case G_MV_L0:
+@@ -1961,6 +2200,9 @@ static void gfx_dp_set_grayscale_color(uint8_t r, uint8_t g, uint8_t b, uint8_t
+ }
+ 
+ static void gfx_dp_set_env_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
++#ifdef __3DS__
++    if(rdp.env_color.r!=r || rdp.env_color.g!=g || rdp.env_color.b!=b || rdp.env_color.a!=a)gfx_flush();
++#endif
+     rdp.env_color.r = r;
+     rdp.env_color.g = g;
+     rdp.env_color.b = b;
+@@ -1968,6 +2210,9 @@ static void gfx_dp_set_env_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+ }
+ 
+ static void gfx_dp_set_prim_color(uint8_t m, uint8_t l, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
++#ifdef __3DS__
++    if(rdp.prim_lod_fraction!=l || rdp.prim_color.r!=r || rdp.prim_color.g!=g || rdp.prim_color.b!=b || rdp.prim_color.a!=a)gfx_flush();
++#endif
+     rdp.prim_lod_fraction = l;
+     rdp.prim_color.r = r;
+     rdp.prim_color.g = g;
+@@ -1982,6 +2227,9 @@ static void gfx_dp_set_prim_color(uint8_t m, uint8_t l, uint8_t r, uint8_t g, ui
+ }
+ 
+ static void gfx_dp_set_fog_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
++#ifdef __3DS__
++    if(rdp.fog_color.r!=r || rdp.fog_color.g!=g || rdp.fog_color.b!=b || rdp.fog_color.a!=a)gfx_flush();
++#endif
+     rdp.fog_color.r = r;
+     rdp.fog_color.g = g;
+     rdp.fog_color.b = b;
+@@ -2029,6 +2277,7 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
+     lrxf = lrxf / (4.0f * HALF_SCREEN_WIDTH) - 1.0f;
+     lryf = -(lryf / (4.0f * HALF_SCREEN_HEIGHT)) + 1.0f;
+ 
++
+     ulxf = gfx_adjust_x_for_aspect_ratio(ulxf);
+     lrxf = gfx_adjust_x_for_aspect_ratio(lrxf);
+ 
+@@ -2274,6 +2523,74 @@ static inline void *seg_addr(uintptr_t w1) {
+ 
+ uintptr_t clearMtx;
+ 
++#ifdef __3DS__
++extern "C" void native_pica_inventory_preview(int);
++static void pd_top_menu_begin(bool enable,unsigned width) {
++    static decltype(rsp) saved_rsp;
++    static decltype(rdp) saved_rdp;
++    static GfxDimensions dimensions,window;
++    static XYWidthHeight native,game;
++    static float aspect;
++    gfx_flush();
++    if(enable) {
++        saved_rsp=rsp;saved_rdp=rdp;
++        dimensions=gfx_current_dimensions;window=gfx_current_window_dimensions;
++        native=gfx_current_native_viewport;game=gfx_current_game_window_viewport;
++        aspect=gfx_current_native_aspect;
++        gfx_current_dimensions.width=gfx_current_window_dimensions.width=width;
++        gfx_current_dimensions.height=gfx_current_window_dimensions.height=240;
++        gfx_current_dimensions.aspect_ratio=gfx_current_window_dimensions.aspect_ratio=float(width)/240.f;
++        gfx_current_native_viewport={0,0,width,240};gfx_current_game_window_viewport={0,0,width,240};
++        gfx_current_native_aspect=float(width)/240.f;rsp.extra_geometry_mode=0;
++        rdp.viewport={0,0,width,240};rdp.scissor=rdp.viewport;
++    }else {
++        gfx_current_dimensions=dimensions;gfx_current_window_dimensions=window;
++        gfx_current_native_viewport=native;gfx_current_game_window_viewport=game;
++        gfx_current_native_aspect=aspect;rsp=saved_rsp;rdp=saved_rdp;
++        rdp.textures_changed[0]=rdp.textures_changed[1]=true;
++    }
++    rsp.aspect_mode=rsp.extra_geometry_mode&G_ASPECT_MODE_EXT;gfx_update_aspect_mode();
++    native_pica_frontend_ui(enable);
++    rendering_state.viewport.width=rendering_state.scissor.width=0;
++    rdp.viewport_or_scissor_changed=true;
++}
++
++static void pd_bottom_begin(bool enable) {
++    static decltype(rsp) saved_rsp;
++    static decltype(rdp) saved_rdp;
++    static GfxDimensions dimensions,window;
++    static XYWidthHeight native,game,viewport,scissor;
++    static float aspect;
++    static uint32_t extra;
++    gfx_flush();
++    if(enable) {
++        saved_rsp=rsp;saved_rdp=rdp;
++        dimensions=gfx_current_dimensions;window=gfx_current_window_dimensions;
++        native=gfx_current_native_viewport;game=gfx_current_game_window_viewport;
++        aspect=gfx_current_native_aspect;extra=rsp.extra_geometry_mode;
++        viewport=rdp.viewport;scissor=rdp.scissor;
++        gfx_current_dimensions.width=gfx_current_window_dimensions.width=320;
++        gfx_current_dimensions.height=gfx_current_window_dimensions.height=240;
++        gfx_current_dimensions.aspect_ratio=gfx_current_window_dimensions.aspect_ratio=4.f/3.f;
++        gfx_current_native_viewport={0,0,320,240};gfx_current_game_window_viewport={0,0,320,240};
++        gfx_current_native_aspect=4.f/3.f;rsp.extra_geometry_mode=0;
++        rdp.viewport={0,0,320,240};rdp.scissor=rdp.viewport;
++    }else {
++        gfx_current_dimensions=dimensions;gfx_current_window_dimensions=window;
++        gfx_current_native_viewport=native;gfx_current_game_window_viewport=game;
++        gfx_current_native_aspect=aspect;rsp.extra_geometry_mode=extra;
++        rsp=saved_rsp;rdp=saved_rdp;
++        rdp.textures_changed[0]=rdp.textures_changed[1]=true;
++        rdp.viewport=viewport;rdp.scissor=scissor;
++    }
++    rsp.aspect_mode=rsp.extra_geometry_mode&G_ASPECT_MODE_EXT;gfx_update_aspect_mode();
++    native_pica_bottom_target(enable);
++    // Force both backend clips to be refreshed after switching LCDs.
++    rendering_state.viewport.width=rendering_state.scissor.width=0;
++    rdp.viewport_or_scissor_changed=true;
++}
++#endif
++
+ static void gfx_run_dl(Gfx* cmd) {
+     // puts("dl");
+     int dummy = 0;
+@@ -2289,6 +2606,26 @@ static void gfx_run_dl(Gfx* cmd) {
+         switch (opcode) {
+                 // RSP commands:
+             case G_NOOP:
++#ifdef __3DS__
++                if((uint32_t(cmd->words.w1)&0xfffffffeu)==0x50445300){gfx_flush();native_pica_sky(cmd->words.w1&1);}
++                if((uint32_t(cmd->words.w1)&0xfffffffeu)==0x50444300){gfx_flush();native_pica_reticle(cmd->words.w1&1);}
++#endif
++#ifdef __3DS__
++                if((uint32_t(cmd->words.w1)&0xfffffffeu)==0x50444600){gfx_flush();native_pica_flat_scope(cmd->words.w1&1);}
++#endif
++#ifdef __3DS__
++                if((uint32_t(cmd->words.w1)&0xfffffffeu)==0x50444d00){gfx_flush();native_pica_menu_background(cmd->words.w1&1);}
++#endif
++#ifdef __3DS__
++                if((uint32_t(cmd->words.w1)&0xfffffffcu)==0x50445400)pd_top_menu_begin(cmd->words.w1&1,(cmd->words.w1&2)?320:400);
++                if((uint32_t(cmd->words.w1)&0xfffffffeu)==0x50444200)pd_bottom_begin(cmd->words.w1&1);
++                if(uint32_t(cmd->words.w1)==0x50445200){gfx_flush();native_pica_bottom_retain();}
++                if((uint32_t(cmd->words.w1)&0xfffffffcu)==0x50444900){gfx_flush();native_pica_inventory_preview(cmd->words.w1&3);}
++                if((uint32_t(cmd->words.w1)&0xfffffffeu)==0x50445600){gfx_flush();pd_viewmodel_scope=cmd->words.w1&1;native_pica_set_viewmodel(pd_viewmodel_scope);}
++
++                if((uint32_t(cmd->words.w1)&0xfffffffeu)==0x50445500){gfx_flush();native_pica_ui_rect(cmd->words.w1&1);}
++                if((uint32_t(cmd->words.w1)&0xfffffffeu)==0x50444700){gfx_flush();pd_glass_scope=(cmd->words.w1&1) && pd_option_get(14);}
++#endif
+                 break;
+             case G_MTX: {
+                 gfx_sp_matrix(C0(16, 8), (const int32_t*)seg_addr(cmd->words.w1));
+@@ -2547,6 +2884,8 @@ extern "C" void gfx_get_dimensions(uint32_t* width, uint32_t* height, int32_t* p
+ }
+ 
+ extern "C" void gfx_init(const GfxInitSettings *settings) {
++    // LRU entries store map iterators. Prevent insertion rehashing the map.
++    gfx_texture_cache.map.reserve(TEXTURE_CACHE_MAX_SIZE);
+     gfx_wapi = settings->wapi;
+     gfx_rapi = settings->rapi;
+     gfx_wapi->init(&settings->window_settings);
+@@ -2675,7 +3014,12 @@ extern "C" void gfx_run(Gfx* commands) {
+     gfx_rapi->update_framebuffer_parameters(0, gfx_current_window_dimensions.width,
+                                             gfx_current_window_dimensions.height, 1, false, true, true,
+                                             !game_renders_to_framebuffer);
+-    gfx_rapi->start_frame();
++    gfx_rapi->start_frame();pd_projection_valid=false;
++#ifdef __3DS__
++ pd_matrix_count=0;pd_gpu_tag=~0u;pd_glass_scope=false;pd_next_id=0;pd_uniform_mask=pd_alpha_mask=pd_texture_level=0;
++ native_pica_frontend_ui(0);native_pica_input_hint(0,0);native_pica_texture_lod(0);
++ for(auto &vertex:rsp.loaded_vertices)vertex.pd_matrix=~0u;
++#endif
+     gfx_rapi->start_draw_to_framebuffer(game_renders_to_framebuffer ? game_framebuffer : 0,
+                                         (float)gfx_current_dimensions.height / SCREEN_HEIGHT);
+     gfx_rapi->clear_framebuffer(true, false);
+diff --git a/port/fast3d/gfx_pc.h b/port/fast3d/gfx_pc.h
+index 0ca5515..dfaa86e 100644
+--- a/port/fast3d/gfx_pc.h
++++ b/port/fast3d/gfx_pc.h
+@@ -25,6 +25,7 @@ struct TextureCacheKey {
+     const uint8_t* palette_addrs[2];
+     uint8_t fmt, siz;
+     uint8_t palette_index;
++    uint32_t palette_hash = 0, size_bytes = 0, line_bytes = 0, full_line_bytes = 0, tile_line_bytes = 0;
+ 
+     bool operator==(const TextureCacheKey&) const noexcept = default;
+ 
+diff --git a/port/src/config.c b/port/src/config.c
+index 596cf3a..4193ef1 100644
+--- a/port/src/config.c
++++ b/port/src/config.c
+@@ -10,7 +10,7 @@
+ 
+ #define CONFIG_MAX_SECNAME 128
+ #define CONFIG_MAX_KEYNAME 256
+-#define CONFIG_MAX_SETTINGS 300
++#define CONFIG_MAX_SETTINGS 512
+ 
+ typedef enum {
+ 	CFG_NONE,
+diff --git a/port/src/libultra.c b/port/src/libultra.c
+index c978d81..897f8a6 100644
+--- a/port/src/libultra.c
++++ b/port/src/libultra.c
+@@ -296,6 +296,18 @@ static inline void osEeepromSave(const char *fname)
+ 	}
+ }
+ 
++#ifdef __3DS__
++static unsigned pd_eeprom_batch_depth;
++static int pd_eeprom_dirty;
++void pd_eeprom_batch_begin(void){pd_eeprom_batch_depth++;}
++void pd_eeprom_batch_end(void){
++ if(!pd_eeprom_batch_depth)return;
++ if(--pd_eeprom_batch_depth==0 && pd_eeprom_dirty){
++  pd_eeprom_dirty=0;osEeepromSave(eepromPath);
++ }
++}
++#endif
++
+ s32 osEepromProbe(OSMesgQueue *mq)
+ {
+ 	return EEPROM_TYPE_16K;
+@@ -323,8 +335,12 @@ s32 osEepromLongWrite(OSMesgQueue *mq, u8 address, u8 *buffer, int nbytes)
+ 	osEeepromLoad(eepromPath);
+ 
+ 	memcpy(eeprom + address * 8, buffer, nbytes);
+-
+-	osEeepromSave(eepromPath);
++#ifdef __3DS__
++ if(pd_eeprom_batch_depth)pd_eeprom_dirty=1;
++ else osEeepromSave(eepromPath);
++#else
++ osEeepromSave(eepromPath);
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/port/src/mixer.c b/port/src/mixer.c
+index 1a42ae2..0558ff6 100644
+--- a/port/src/mixer.c
++++ b/port/src/mixer.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "native_dsp_mix.h"
++#endif
+ #include <stdint.h>
+ #include <string.h>
+ #include <assert.h>
+@@ -551,6 +554,9 @@ void aEnvMixerImpl(uint8_t flags, ENVMIX_STATE state, int16_t rvol) {
+     #define XOR 1
+     #endif
+ 
++#ifdef __3DS__
++    int16_t *pd_dry=native_dsp_mix_target((uintptr_t)savedstate,0,nsamples);
++#endif
+     for (int i = 0; i < nsamples; ++i) {
+         int16_t gain[4];
+         int16_t vol[2];
+@@ -576,7 +582,11 @@ void aEnvMixerImpl(uint8_t flags, ENVMIX_STATE state, int16_t rvol) {
+         gain[3] = clamp16((vol[1] * volwet + 0x4000) >> 15);
+ 
+         const int16_t insamp = in[i^XOR];
+-        for (int j = 0; j < 4; ++j) {
++        int first=0;
++#ifdef __3DS__
++        if(pd_dry){pd_dry[(i^XOR)*2]=clamp16((insamp*gain[0])>>15);pd_dry[(i^XOR)*2+1]=clamp16((insamp*gain[1])>>15);first=2;}
++#endif
++        for (int j = first; j < 4; ++j) {
+             *outptr[j] = clamp16(*outptr[j] + ((insamp * gain[j]) >> 15));
+         }
+     }
+diff --git a/port/src/optionsmenu.c b/port/src/optionsmenu.c
+index 6ab58c2..eddfcf3 100644
+--- a/port/src/optionsmenu.c
++++ b/port/src/optionsmenu.c
+@@ -15,6 +15,9 @@
+ #include "input.h"
+ #include "config.h"
+ 
++#ifdef __3DS__
++static MenuItemHandlerResult pdHandler(s32,struct menuitem *,union handlerdata *);
++#endif
+ static s32 g_ExtMenuPlayer = 0;
+ static struct menudialogdef *g_ExtNextDialog = NULL;
+ 
+@@ -616,6 +619,35 @@ static MenuItemHandlerResult menuhandlerController(s32 operation, struct menuite
+ 	return 0;
+ }
+ 
++#ifdef __3DS__
++struct menuitem g_ExtendedControllerMenuItems[] = {
++	{
++		MENUITEMTYPE_SELECTABLE,
++		0,
++		MENUITEMFLAG_SELECTABLE_OPENSDIALOG | MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"Stick Settings...\n",
++		0,
++		(void *)&g_ExtendedStickMenuDialog,
++	},
++	{
++		MENUITEMTYPE_SEPARATOR,
++		0,
++		0,
++		0,
++		0,
++		NULL,
++	},
++	{
++		MENUITEMTYPE_SELECTABLE,
++		0,
++		MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,
++		L_OPTIONS_213, // "Back"
++		0,
++		NULL,
++	},
++	{ MENUITEMTYPE_END },
++};
++#else
+ struct menuitem g_ExtendedControllerMenuItems[] = {
+ 	{
+ 		MENUITEMTYPE_DROPDOWN,
+@@ -675,6 +707,7 @@ struct menuitem g_ExtendedControllerMenuItems[] = {
+ 	},
+ 	{ MENUITEMTYPE_END },
+ };
++#endif
+ 
+ static char g_ExtendedControllerMenuTitle[] = "Player 1 Controller Options";
+ struct menudialogdef g_ExtendedControllerMenuDialog = {
+@@ -765,6 +798,18 @@ static MenuItemHandlerResult menuhandlerVsync(s32 operation, struct menuitem *it
+ 	return 0;
+ }
+ 
++#ifdef __3DS__
++static MenuItemHandlerResult menuhandlerFramerateLimit(s32 operation, struct menuitem *item, union handlerdata *data)
++{
++ switch(operation){
++ case MENUOP_GETOPTIONCOUNT:data->dropdown.value=2;break;
++ case MENUOP_GETOPTIONTEXT:return (intptr_t)(data->dropdown.value?"60 FPS":"30 FPS");
++ case MENUOP_GETSELECTEDINDEX:data->dropdown.value=videoGetFramerateLimit()==60;break;
++ case MENUOP_SET:videoSetFramerateLimit(data->dropdown.value?60:30);break;
++ }
++ return 0;
++}
++#else
+ static MenuItemHandlerResult menuhandlerFramerateLimit(s32 operation, struct menuitem *item, union handlerdata *data)
+ {
+ 	switch (operation) {
+@@ -786,6 +831,8 @@ static MenuItemHandlerResult menuhandlerFramerateLimit(s32 operation, struct men
+ 	return 0;
+ }
+ 
++#endif
++
+ static MenuItemHandlerResult menuhandlerMSAA(s32 operation, struct menuitem *item, union handlerdata *data)
+ {
+ 	s32 msaa;
+@@ -861,8 +908,10 @@ static MenuItemHandlerResult menuhandlerTexFilter(s32 operation, struct menuitem
+ {
+ 	static const char *opts[] = {
+ 		"Nearest",
+-		"Bilinear",
+-		"Three Point"
++		"Bilinear"
++#ifndef __3DS__
++		,"Three Point"
++#endif
+ 	};
+ 
+ 	switch (operation) {
+@@ -1036,6 +1085,99 @@ static MenuItemHandlerResult menuhandlerOverexposureScale(s32 operation, struct
+ 	return 0;
+ }
+ 
++#ifdef __3DS__
++struct menuitem g_ExtendedVideoMenuItems[] = {
++	{
++		MENUITEMTYPE_DROPDOWN,
++		0,
++		MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"Resolution",
++		0,
++		menuhandlerResolution,
++	},
++	{
++		MENUITEMTYPE_SEPARATOR,
++		0,
++		0,
++		0,
++		0,
++		NULL,
++	},
++	{
++		MENUITEMTYPE_DROPDOWN,
++		0,
++		MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"Framerate Limit",
++		0,
++		menuhandlerFramerateLimit,
++	},
++	{
++		MENUITEMTYPE_SEPARATOR,
++		0,
++		0,
++		0,
++		0,
++		NULL,
++	},
++	{
++		MENUITEMTYPE_DROPDOWN,
++		0,
++		MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"Texture Filtering",
++		0,
++		menuhandlerTexFilter,
++	},
++	{
++		MENUITEMTYPE_SEPARATOR,
++		0,
++		0,
++		0,
++		0,
++		NULL,
++	},
++	{
++		MENUITEMTYPE_DROPDOWN,
++		0,
++		MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"HUD Centering",
++		0,
++		menuhandlerCenterHUD,
++	},
++	{
++		MENUITEMTYPE_CHECKBOX,
++		0,
++		MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"GE64-style Muzzle Flashes",
++		0,
++		menuhandlerGeMuzzleFlashes,
++	},
++	{
++		MENUITEMTYPE_SLIDER,
++		0,
++		MENUITEMFLAG_LITERAL_TEXT | MENUITEMFLAG_SLIDER_WIDE,
++		(uintptr_t)"Explosion Shake",
++		20,
++		menuhandlerScreenShake,
++	},
++	{
++		MENUITEMTYPE_SEPARATOR,
++		0,
++		0,
++		0,
++		0,
++		NULL,
++	},
++	{
++		MENUITEMTYPE_SELECTABLE,
++		0,
++		MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,
++		L_OPTIONS_213, // "Back"
++		0,
++		NULL,
++	},
++	{ MENUITEMTYPE_END },
++};
++#else
+ struct menuitem g_ExtendedVideoMenuItems[] = {
+ 	{
+ 		MENUITEMTYPE_CHECKBOX,
+@@ -1231,10 +1373,11 @@ struct menuitem g_ExtendedVideoMenuItems[] = {
+ 	},
+ 	{ MENUITEMTYPE_END },
+ };
++#endif
+ 
+ struct menudialogdef g_ExtendedVideoMenuDialog = {
+ 	MENUDIALOGTYPE_DEFAULT,
+-	(uintptr_t)"Extended Video Options",
++	(uintptr_t)"Video Options",
+ 	g_ExtendedVideoMenuItems,
+ 	NULL,
+ 	MENUDIALOGFLAG_LITERAL_TEXT,
+@@ -1255,6 +1398,11 @@ static MenuItemHandlerResult menuhandlerDisableMpDeathMusic(s32 operation, struc
+ }
+ 
+ struct menuitem g_ExtendedAudioMenuItems[] = {
++#ifdef __3DS__
++ {MENUITEMTYPE_DROPDOWN,0,MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)"Audio Worker",6,pdHandler},
++ {MENUITEMTYPE_DROPDOWN,0,MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)"Mixer (Restart)",15,pdHandler},
++#endif
++
+ 	{
+ 		MENUITEMTYPE_CHECKBOX,
+ 		0,
+@@ -1921,8 +2069,12 @@ struct menudialogdef g_ExtendedBindsMenuDialog = {
+ static MenuItemHandlerResult menuhandlerOpenControllerMenu(s32 operation, struct menuitem *item, union handlerdata *data)
+ {
+ 	if (operation == MENUOP_SET) {
+-		g_ExtNextDialog = &g_ExtendedControllerMenuDialog;
++		#ifdef __3DS__
++        g_ExtMenuPlayer=0;menuPushDialog(&g_ExtendedControllerMenuDialog);
++#else
++        g_ExtNextDialog = &g_ExtendedControllerMenuDialog;
+ 		menuPushDialog(&g_ExtendedSelectPlayerMenuDialog);
++#endif
+ 	}
+ 	return 0;
+ }
+@@ -1930,8 +2082,12 @@ static MenuItemHandlerResult menuhandlerOpenControllerMenu(s32 operation, struct
+ static MenuItemHandlerResult menuhandlerOpenGameMenu(s32 operation, struct menuitem *item, union handlerdata *data)
+ {
+ 	if (operation == MENUOP_SET) {
+-		g_ExtNextDialog = &g_ExtendedGameMenuDialog;
++		#ifdef __3DS__
++        g_ExtMenuPlayer=0;menuPushDialog(&g_ExtendedGameMenuDialog);
++#else
++        g_ExtNextDialog = &g_ExtendedGameMenuDialog;
+ 		menuPushDialog(&g_ExtendedSelectPlayerMenuDialog);
++#endif
+ 	}
+ 	return 0;
+ }
+@@ -1945,6 +2101,144 @@ static MenuItemHandlerResult menuhandlerOpenBindsMenu(s32 operation, struct menu
+ 	return 0;
+ }
+ 
++#ifdef __3DS__
++#include "pd_runtime.h"
++#include "native_motion_sensor.h"
++static MenuItemHandlerResult pdHandler(s32 op,struct menuitem *item,union handlerdata *data){
++ static const char *lod[]={"Disabled","Original","Balanced","Strong","Dynamic"};
++ static const char *levels[]={"Original","Low","Medium","High"};
++ static const char *distance[]={"Original","Far","Medium","Near"};
++ static const char *rates[]={"Original","30 Hz","15 Hz","5 Hz"};
++ static const char *filter[]={"Off","Sharp Low","Sharp Medium","Sharp High","Smooth Low","Smooth Medium","Smooth High"};
++ static const char *strength[]={"Off","Low","High"};
++ static const char *activation[]={"Always","Crouch","Zoom","Crouch or Zoom"};
++ static const char *toggle[]={"Off","On"};
++ static const char *mixer[]={"CPU","DSP Dry Voices"};
++ static const char *gyro[]={"Off","Aim Only","Look + Aim"};
++ static const char *bars[]={"Original","Larger","Off"};
++ static const char *spaces[]={"Local","World","Player"};
++ static const char *aimmove[]={"Free","Classic"};
++ static const char *axes[]={"Yaw","Roll"};static const char *gains[]={"25%","50%","75%","100%","125%","150%","175%","200%","225%","250%","275%","300%","325%","350%","375%","400%"};
++ static const char *depth[]={"0%","25%","50%","75%","100%","125%","150%","175%","200%"};
++ const char **labels=toggle;int count=2;int key=item->param3;
++ if(key==27){
++  if(op==MENUOP_GETOPTIONCOUNT)data->dropdown.value=1;
++  if(op==MENUOP_SET)native_motion_calibrate();
++  if(op==MENUOP_GETSELECTEDINDEX)data->dropdown.value=0;
++  if(op==MENUOP_GETOPTIONTEXT){static char progress[32];int state=native_motion_calibration_status();
++   if(state>0){snprintf(progress,sizeof progress,"Keep still %d%%",native_motion_calibration_progress());return (intptr_t)progress;}
++   return (intptr_t)(state==-1?"Calibrated":state==-2?"Try again":"Start");}
++  return 0;
++ }
++ if(key>=35 && key<=42 && key!=38 && key!=41){
++  int counts[]={20,11,21,0,11,21,0,12};int n=counts[key-35];
++  if(op==MENUOP_GETOPTIONCOUNT)data->dropdown.value=n;
++  if(op==MENUOP_GETSELECTEDINDEX)data->dropdown.value=pd_option_get(key);
++  if(op==MENUOP_SET)pd_option_set(key,data->dropdown.value);
++  if(op==MENUOP_GETOPTIONTEXT){static char text[32];int i=data->dropdown.value;
++   if(i<0 || i>=n)i=0;
++   if(key==42 && !i)return (intptr_t)"Original";
++   int v=key==35?10+i*10:key==36?-20+i*5:key==37?i*5:key==39?50+i*5:key==40?i:(i-1)*10;
++   if(key==36)snprintf(text,sizeof text,"%s%d.%d%%",v<0?"-":"",abs(v)/10,abs(v)%10);
++   else snprintf(text,sizeof text,"%d%%",v);
++   return (intptr_t)text;}
++  return 0;
++ }
++ static const char *reticledepth[]={"Dynamic","HUD"};
++ static const char *shapes[]={"Original","Dot","Cross","Cross + Dot","Circle","Circle + Dot","T-shape","Diamond"};
++ static const char *colours[]={"Original","White","Amber","Red","Blue","Gold","Purple","Green"};
++ switch(key){case 38:labels=reticledepth;count=2;break;case 41:labels=shapes;count=8;break;case 44:labels=colours;count=8;break;case 28:labels=aimmove;count=2;break;case 19:labels=gyro;count=3;break;case 20:case 21:case 26:case 33:labels=gains;count=16;break;case 22:labels=spaces;count=3;break;case 23:labels=axes;count=2;break;case 25:labels=depth;count=9;break;case 18:labels=bars;count=3;break;case 15:labels=mixer;count=2;break;case 0:labels=lod;count=5;break;case 1:case 3:labels=levels;count=4;break;case 2:labels=distance;count=4;break;case 4:case 17:labels=rates;count=4;break;case 8:labels=filter;count=7;break;case 9:case 10:case 11:labels=strength;count=3;break;case 12:labels=activation;count=4;break;}
++ switch(op){case MENUOP_GETOPTIONCOUNT:data->dropdown.value=count;break;case MENUOP_GETOPTIONTEXT:return (intptr_t)labels[data->dropdown.value<count?data->dropdown.value:0];case MENUOP_GETSELECTEDINDEX:data->dropdown.value=pd_option_get(key);break;case MENUOP_SET:pd_option_set(key,data->dropdown.value);break;}
++ return 0;
++}
++#define PD_OPTION(label,key) {MENUITEMTYPE_DROPDOWN,0,MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)label,key,pdHandler}
++struct menuitem pdAccessibilityItems[]={PD_OPTION("Aim Lock",29),PD_OPTION("Stamina Sway",30),PD_OPTION("Steady Scope",31),
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,L_OPTIONS_213,0,NULL},{MENUITEMTYPE_END}};
++struct menudialogdef pdAccessibilityDialog={MENUDIALOGTYPE_DEFAULT,(uintptr_t)"Accessibility",pdAccessibilityItems,NULL,MENUDIALOGFLAG_LITERAL_TEXT,NULL};
++struct menuitem pdStereoItems[]={PD_OPTION("3D Strength",25),PD_OPTION("Auto Convergence",34),PD_OPTION("Convergence",35),PD_OPTION("Pop-out Limit",36),PD_OPTION("HUD Depth",37),PD_OPTION("Crosshair Depth",38),PD_OPTION("Ghost Contrast",39),PD_OPTION("Black Floor",40),
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,L_OPTIONS_213,0,NULL},{MENUITEMTYPE_END}};
++struct menudialogdef pdStereoDialog={MENUDIALOGTYPE_DEFAULT,(uintptr_t)"3D Settings",pdStereoItems,NULL,MENUDIALOGFLAG_LITERAL_TEXT,NULL};
++struct menuitem pdCrosshairItems[]={PD_OPTION("Style",41),PD_OPTION("Colour",44),PD_OPTION("Opacity",42),PD_OPTION("Always Crosshair",43),
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,L_OPTIONS_213,0,NULL},{MENUITEMTYPE_END}};
++struct menudialogdef pdCrosshairDialog={MENUDIALOGTYPE_DEFAULT,(uintptr_t)"Crosshair",pdCrosshairItems,NULL,MENUDIALOGFLAG_LITERAL_TEXT,NULL};
++struct menuitem pdExperimentalItems[]={PD_OPTION("GPU Transforms (Test)",13),PD_OPTION("Retained GPU Meshes",16),PD_OPTION("Distant Guard AI",17),PD_OPTION("Hidden Guard LOS Cache",5),
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,L_OPTIONS_213,0,NULL},{MENUITEMTYPE_END}};
++struct menudialogdef pdExperimentalDialog={MENUDIALOGTYPE_DEFAULT,(uintptr_t)"Experimental",pdExperimentalItems,NULL,MENUDIALOGFLAG_LITERAL_TEXT,NULL};
++struct menuitem pdControlsItems[]={PD_OPTION("Gyro Look",19),PD_OPTION("Gyro Sensitivity",20),PD_OPTION("Touch Sensitivity",21),PD_OPTION("Look Horizontal",26),PD_OPTION("Look Vertical",33),PD_OPTION("Gyro Filter",32),PD_OPTION("Gyro Space",22),PD_OPTION("Local Turn Axis",23),PD_OPTION("Calibrate Gyro",27),PD_OPTION("Flick Stick (Test)",24),PD_OPTION("Aim Movement",28),
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,L_OPTIONS_213,0,NULL},{MENUITEMTYPE_END}};
++struct menudialogdef pdControlsDialog={MENUDIALOGTYPE_DEFAULT,(uintptr_t)"Controls",pdControlsItems,NULL,MENUDIALOGFLAG_LITERAL_TEXT,NULL};
++struct menuitem pdPerformanceItems[]={
++ PD_OPTION("Model LOD",0),PD_OPTION("Texture LOD",1),PD_OPTION("View Distance",2),PD_OPTION("Effects LOD",3),
++ PD_OPTION("Guard Sight Checks",4),PD_OPTION("Simple Dark Glass",14),
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,L_OPTIONS_213,0,NULL},{MENUITEMTYPE_END}};
++struct menudialogdef pdPerformanceDialog={MENUDIALOGTYPE_DEFAULT,(uintptr_t)"Performance",pdPerformanceItems,NULL,MENUDIALOGFLAG_LITERAL_TEXT,NULL};
++struct menuitem pdEffectsItems[]={
++ PD_OPTION("Cutscene Bars",18),PD_OPTION("Supersampling",7),PD_OPTION("Image Filter",8),PD_OPTION("Vignette",9),PD_OPTION("Vignette Activation",12),PD_OPTION("Bloom",10),PD_OPTION("Film Grain",11),
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,L_OPTIONS_213,0,NULL},{MENUITEMTYPE_END}};
++struct menudialogdef pdEffectsDialog={MENUDIALOGTYPE_DEFAULT,(uintptr_t)"Screen Effects",pdEffectsItems,NULL,MENUDIALOGFLAG_LITERAL_TEXT,NULL};
++#endif
++
++#ifdef __3DS__
++struct menuitem g_ExtendedMenuItems[] = {
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_OPENSDIALOG|MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)"3D Settings\n",0,(void *)&pdStereoDialog},
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_OPENSDIALOG|MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)"Crosshair\n",0,(void *)&pdCrosshairDialog},
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_OPENSDIALOG|MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)"Accessibility\n",0,(void *)&pdAccessibilityDialog},
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_OPENSDIALOG|MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)"Experimental\n",0,(void *)&pdExperimentalDialog},
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_OPENSDIALOG|MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)"Controls\n",0,(void *)&pdControlsDialog},
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_OPENSDIALOG|MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)"Performance\n",0,(void *)&pdPerformanceDialog},
++ {MENUITEMTYPE_SELECTABLE,0,MENUITEMFLAG_SELECTABLE_OPENSDIALOG|MENUITEMFLAG_LITERAL_TEXT,(uintptr_t)"Screen Effects\n",0,(void *)&pdEffectsDialog},
++
++	{
++		MENUITEMTYPE_SELECTABLE,
++		0,
++		MENUITEMFLAG_SELECTABLE_OPENSDIALOG | MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"Video\n",
++		0,
++		(void *)&g_ExtendedVideoMenuDialog,
++	},
++	{
++		MENUITEMTYPE_SELECTABLE,
++		0,
++		MENUITEMFLAG_SELECTABLE_OPENSDIALOG | MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"Audio\n",
++		0,
++		(void *)&g_ExtendedAudioMenuDialog,
++	},
++	{
++		MENUITEMTYPE_SELECTABLE,
++		0,
++		MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"Controller\n",
++		0,
++		menuhandlerOpenControllerMenu,
++	},
++	{
++		MENUITEMTYPE_SELECTABLE,
++		0,
++		MENUITEMFLAG_LITERAL_TEXT,
++		(uintptr_t)"Game\n",
++		0,
++		menuhandlerOpenGameMenu,
++	},
++	{
++		MENUITEMTYPE_SEPARATOR,
++		0,
++		0,
++		0,
++		0,
++		NULL,
++	},
++	{
++		MENUITEMTYPE_SELECTABLE,
++		0,
++		MENUITEMFLAG_SELECTABLE_CLOSESDIALOG,
++		L_OPTIONS_213, // "Back"
++		0,
++		NULL,
++	},
++	{ MENUITEMTYPE_END },
++};
++#else
+ struct menuitem g_ExtendedMenuItems[] = {
+ 	{
+ 		MENUITEMTYPE_SELECTABLE,
+@@ -2012,10 +2306,11 @@ struct menuitem g_ExtendedMenuItems[] = {
+ 	},
+ 	{ MENUITEMTYPE_END },
+ };
++#endif
+ 
+ struct menudialogdef g_ExtendedMenuDialog = {
+ 	MENUDIALOGTYPE_DEFAULT,
+-	(uintptr_t)"Extended Options",
++	(uintptr_t)"3DS Options",
+ 	g_ExtendedMenuItems,
+ 	NULL,
+ 	MENUDIALOGFLAG_LITERAL_TEXT,
+diff --git a/port/src/pdmain.c b/port/src/pdmain.c
+index 277bf37..2cd5cb2 100644
+--- a/port/src/pdmain.c
++++ b/port/src/pdmain.c
+@@ -73,6 +73,9 @@
+ #include "data.h"
+ #include "types.h"
+ #include "system.h"
++#ifdef __3DS__
++#include "pd_runtime.h"
++#endif
+ 
+ extern u8 *g_MempHeap;
+ extern u32 g_MempHeapSize;
+@@ -268,7 +271,7 @@ void mainInit(void)
+ 	bodiesInit();
+ 	titleInit();
+ 
+-	modelSetDistanceChecksDisabled(true); // don't use LODs
++	modelSetDistanceChecksDisabled(false); // retain original model distance nodes
+ 
+ 	g_MainIsBooting = 0;
+ }
+@@ -417,6 +420,9 @@ void mainLoop(void)
+ 
+ 		mempResetPool(MEMPOOL_7);
+ 		mempResetPool(MEMPOOL_STAGE);
++#ifdef __3DS__
++ pd_runtime_reset();
++#endif
+ 		filesStop(4);
+ 
+ 		if (argFindByPrefix(1, "-ma")) {
+@@ -495,6 +501,9 @@ void mainLoop(void)
+ 		zbufReset(g_StageNum);
+ 		lvReset(g_StageNum);
+ 		viReset(g_StageNum);
++#ifdef __3DS__
++		frametimeInit(); // Stage loading is not elapsed gameplay time.
++#endif
+ 		frametimeCalculate();
+ 		profileReset();
+ 
+@@ -542,6 +551,9 @@ void mainTick(void)
+ 			gDPSetTile(gdl++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 0, 0x0000, G_TX_LOADTILE, 0, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOLOD);
+ 			gDPSetTile(gdl++, G_IM_FMT_RGBA, G_IM_SIZ_4b, 0, 0x0100, 6, 0, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOLOD);
+ 
++#ifdef __3DS__
++            u64 pd_scene_start=sysGetMicroseconds();
++#endif
+ 			lvTick();
+ 			playermgrShuffle();
+ 
+@@ -560,7 +572,14 @@ void mainTick(void)
+ 				}
+ 			}
+ 
++#ifdef __3DS__
++            pd_profile_record(3,sysGetMicroseconds()-pd_scene_start);
++            u64 pd_render_start=sysGetMicroseconds();
++#endif
+ 			gdl = lvRender(gdl);
++#ifdef __3DS__
++            pd_profile_record(4,sysGetMicroseconds()-pd_render_start);
++#endif
+ 
+ 			if (debugGetProfileMode() >= 2) {
+ 				gdl = profileRender(gdl);
+diff --git a/port/src/pdsched.c b/port/src/pdsched.c
+index 1f88005..8580bbd 100644
+--- a/port/src/pdsched.c
++++ b/port/src/pdsched.c
+@@ -1,3 +1,7 @@
++#ifdef __3DS__
++#include "pd_runtime.h"
++#include "system.h"
++#endif
+ #include <PR/ultratypes.h>
+ #include <PR/ultrasched.h>
+ #include "lib/boot.h"
+@@ -242,7 +246,7 @@ void schedStartFrame(OSSched *sc)
+ 	videoStartFrame();
+ }
+ 
+-void schedAudioFrame(OSSched *sc)
++static void schedAudioFrameBody(OSSched *sc)
+ {
+ 	s32 i;
+ 
+@@ -254,6 +258,17 @@ void schedAudioFrame(OSSched *sc)
+ 	}
+ }
+ 
++#ifdef __3DS__
++static void pd_audio_job(void *sc){u64 start=sysGetMicroseconds();schedAudioFrameBody(sc);pd_profile_record(10,sysGetMicroseconds()-start);}
++#endif
++void schedAudioFrame(OSSched *sc){
++#ifdef __3DS__
++ pd_audio_dispatch(pd_audio_job,sc);
++#else
++ schedAudioFrameBody(sc);
++#endif
++}
++
+ /**
+  * Handle a retrace (vsync) event.
+  *
+@@ -298,6 +313,9 @@ void schedEndFrame(OSSched *sc)
+ 	schedAudioFrame(sc);
+ 	schedRenderCrashPeriodically(sc->frameCount);
+ 	videoEndFrame();
++#ifdef __3DS__
++ pd_audio_join();
++#endif
+ 
+ 	if (g_MainIsBooting == 0) {
+ 		schedConsiderScreenshot();
+diff --git a/port/src/preprocess/segaudio.c b/port/src/preprocess/segaudio.c
+index 3ddbdf5..189e766 100644
+--- a/port/src/preprocess/segaudio.c
++++ b/port/src/preprocess/segaudio.c
+@@ -68,10 +68,16 @@ struct n64_bankfile {
+ 	u32 bankArray[1]; // ptr to struct n64_bank
+ };
+ 
++// Key maps occupy six bytes. Align every following object before recording
++// its relocated offset: ARM load-multiple instructions require word alignment.
++// Pointer alignment also keeps the converted bank valid on 64-bit hosts.
++#define AL_ALIGN_ITEM(pos) (((pos) + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1))
++
+ // only proceeds to convert the next item if it's not already converted
+ #define AL_NEXT_ITEM(field, func) { \
+ 	struct ptrmarker *marker = ptrFind(srcpos); \
+ 	if (marker == NULL) { \
++		dstpos = AL_ALIGN_ITEM(dstpos); \
+ 		field = (void *)(uintptr_t)(dstpos); \
+ 		ptrAdd(srcpos, (uintptr_t)(field)); \
+ 		dstpos = func(dst, dstpos, src, srcpos); \
+@@ -305,6 +311,7 @@ static u32 convertAudioBankFile(u8 *dst, u8 *src)
+ 	u32 dstpos = sizeof(ALBankFile) + sizeof(uintptr_t) * (bankCount - 1);
+ 
+ 	for (int i = 0; i < bankCount; i++) {
++		dstpos = AL_ALIGN_ITEM(dstpos);
+ 		host_bankfile->bankArray[i] = (void *)(uintptr_t)(dstpos);
+ 		u32 srcpos = PD_BE32(n64_bankfile->bankArray[i]);
+ 		dstpos = convertAudioBank(dst, dstpos, src, srcpos);
+diff --git a/src/game/bondgun.c b/src/game/bondgun.c
+index 7415bf8..b1a61f5 100644
+--- a/src/game/bondgun.c
++++ b/src/game/bondgun.c
+@@ -1,3 +1,4 @@
++#include "pd_runtime.h"
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "../lib/naudio/n_sndp.h"
+@@ -3546,8 +3547,8 @@ void bgun0f09d8dc(f32 breathing, f32 arg1, f32 arg2, f32 arg3, f32 arg4)
+ 	}
+ 
+ 	if (bmoveGetCrouchPos() != CROUCHPOS_SQUAT) {
+-		if (player->gunposamplitude < 0.3f * g_Vars.currentplayer->bondbreathing) {
+-			player->gunposamplitude = 0.3f * g_Vars.currentplayer->bondbreathing;
++		if (player->gunposamplitude < 0.3f * pd_controls_breathing(g_Vars.currentplayer->bondbreathing)) {
++			player->gunposamplitude = 0.3f * pd_controls_breathing(g_Vars.currentplayer->bondbreathing);
+ 		}
+ 	}
+ 
+diff --git a/src/game/bondhead.c b/src/game/bondhead.c
+index 75c2b4b..536b738 100644
+--- a/src/game/bondhead.c
++++ b/src/game/bondhead.c
+@@ -1,3 +1,4 @@
++#include "pd_runtime.h"
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "game/bondmove.h"
+@@ -224,7 +225,7 @@ void bheadUpdate(f32 arg0, f32 arg1)
+ 
+ 		if (bmoveGetCrouchPos() != CROUCHPOS_SQUAT) {
+ 			g_Vars.currentplayer->standfrac +=
+-				(0.0083333337679505f + 0.025000002235174f * g_Vars.currentplayer->bondbreathing)
++				(0.0083333337679505f + 0.025000002235174f * pd_controls_breathing(g_Vars.currentplayer->bondbreathing))
+ 				* g_Vars.lvupdate60freal;
+ 
+ 			if (g_Vars.currentplayer->standfrac >= 1) {
+@@ -237,16 +238,16 @@ void bheadUpdate(f32 arg0, f32 arg1)
+ 					&g_Vars.currentplayer->standlook[1 - g_Vars.currentplayer->standcnt],
+ 					g_Vars.currentplayer->standfrac, &lookvel);
+ 
+-			lookvel.x *= 1 + 5 * g_Vars.currentplayer->bondbreathing;
+-			lookvel.y *= 1 + 5 * g_Vars.currentplayer->bondbreathing;
++			lookvel.x *= 1 + 5 * pd_controls_breathing(g_Vars.currentplayer->bondbreathing);
++			lookvel.y *= 1 + 5 * pd_controls_breathing(g_Vars.currentplayer->bondbreathing);
+ 
+ 			func0f096b20(
+ 					&g_Vars.currentplayer->standup[g_Vars.currentplayer->standcnt],
+ 					&g_Vars.currentplayer->standup[1 - g_Vars.currentplayer->standcnt],
+ 					g_Vars.currentplayer->standfrac, &upvel);
+ 
+-			upvel.x *= 1 + 5 * g_Vars.currentplayer->bondbreathing;
+-			upvel.z *= 1 + 5 * g_Vars.currentplayer->bondbreathing;
++			upvel.x *= 1 + 5 * pd_controls_breathing(g_Vars.currentplayer->bondbreathing);
++			upvel.z *= 1 + 5 * pd_controls_breathing(g_Vars.currentplayer->bondbreathing);
+ 		}
+ 	}
+ 
+@@ -307,7 +308,7 @@ void bheadSetSpeed(f32 speed)
+ f32 bheadGetBreathingValue(void)
+ {
+ 	if (g_Vars.currentplayer->headanim >= 0) {
+-		f32 a = g_Vars.currentplayer->bondbreathing * 0.012500001f + (1.0f / 240.0f);
++		f32 a = pd_controls_breathing(g_Vars.currentplayer->bondbreathing) * 0.012500001f + (1.0f / 240.0f);
+ 		f32 b = modelGetAbsAnimSpeed(&g_Vars.currentplayer->model);
+ 
+ 		if (b > 0) {
+diff --git a/src/game/bondmove.c b/src/game/bondmove.c
+index 414e3cc..ebb784c 100644
+--- a/src/game/bondmove.c
++++ b/src/game/bondmove.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "pd_runtime.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "game/activemenu.h"
+@@ -806,7 +809,14 @@ void bmoveProcessInput(bool allowc1x, bool allowc1y, bool allowc1buttons, bool i
+ #ifndef PLATFORM_N64
+ 	if (allowmlook) {
+ 		inputMouseGetScaledDelta(&movedata.freelookdx, &movedata.freelookdy);
+-		allowmcross = (PLAYER_EXTCFG().mouseaimmode == MOUSEAIM_CLASSIC) &&
++#ifdef __3DS__
++        pd_gyro_movedata(&movedata);
++#endif
++		allowmcross = (PLAYER_EXTCFG().mouseaimmode == MOUSEAIM_CLASSIC
++#ifdef __3DS__
++            || pd_option_get(19) || pd_touch_look_allowed()
++#endif
++        ) &&
+ 			(movedata.freelookdx || movedata.freelookdy || g_Vars.currentplayer->swivelpos[0] || g_Vars.currentplayer->swivelpos[1]);
+ 		if (movedata.invertpitch) {
+ 			movedata.freelookdy = -movedata.freelookdy;
+@@ -1348,7 +1358,11 @@ void bmoveProcessInput(bool allowc1x, bool allowc1y, bool allowc1buttons, bool i
+ 								movedata.analogwalk = 0;
+ 								movedata.analoglean = 0.f;
+ 							}
+-							if (PLAYER_EXTCFG().mouseaimmode == MOUSEAIM_LOCKED || bgunGetWeaponNum(HAND_RIGHT) == WEAPON_HORIZONSCANNER) {
++							if ((PLAYER_EXTCFG().mouseaimmode == MOUSEAIM_LOCKED
++#ifdef __3DS__
++                            && !pd_option_get(19)
++#endif
++                            ) || bgunGetWeaponNum(HAND_RIGHT) == WEAPON_HORIZONSCANNER) {
+ 								movedata.cannaturalpitch = movedata.cannaturalpitch || (movedata.freelookdy != 0.0f);
+ 								movedata.cannaturalturn = movedata.cannaturalturn  || (movedata.freelookdx != 0.0f);
+ 							}
+@@ -1840,6 +1854,9 @@ void bmoveProcessInput(bool allowc1x, bool allowc1y, bool allowc1buttons, bool i
+ 		}
+ 	}
+ 
++#ifdef __3DS__
++ pd_controls_classic(&movedata,c2stickx,c2sticky,canmanualzoom);
++#endif
+ 	g_Vars.currentplayer->bondactivateorreload = 0;
+ 
+ 	s32 usereloads = (controlmode != CONTROLMODE_PC);
+@@ -2080,7 +2097,10 @@ void bmoveProcessInput(bool allowc1x, bool allowc1y, bool allowc1buttons, bool i
+ 				}
+ 
+ #ifndef PLATFORM_N64
+-				fVar25 += movedata.freelookdy * mlookscale;
++				#ifdef __3DS__
++                fVar25 *= (25+25*pd_option_get(33))*.01f;
++#endif
++                fVar25 += movedata.freelookdy * mlookscale;
+ #endif
+ 
+ 				g_Vars.currentplayer->speedverta = -fVar25 * tmp;
+@@ -2121,7 +2141,10 @@ void bmoveProcessInput(bool allowc1x, bool allowc1y, bool allowc1buttons, bool i
+ 		}
+ 
+ #ifndef PLATFORM_N64
+-		fVar25 += movedata.freelookdx * mlookscale;
++		#ifdef __3DS__
++        fVar25 *= (25+25*pd_option_get(26))*.01f;
++#endif
++        fVar25 += movedata.freelookdx * mlookscale;
+ #endif
+ 
+ 		g_Vars.currentplayer->speedthetacontrol = fVar25 * tmp;
+@@ -2225,10 +2248,34 @@ void bmoveProcessInput(bool allowc1x, bool allowc1y, bool allowc1buttons, bool i
+ 			bgunSwivelWithDamp(x, y, PAL ? 0.955f : 0.963f);
+ 		}
+ 	} else if (movedata.canmanualaim) {
++#ifdef __3DS__
++        if(pd_option_get(29) && pd_motion_allowed()){
++         float gain=(25+25*pd_option_get(26))*.01f;
++         float dt=g_Vars.lvupdate60freal;
++         if(dt>4)dt=4;
++         g_Vars.currentplayer->vv_theta+=movedata.c1stickxraw/80.f*gain*dt*2.f;
++         g_Vars.currentplayer->vv_verta+=movedata.c1stickyraw/80.f*gain*dt*2.f;
++         if(g_Vars.currentplayer->vv_verta>89)g_Vars.currentplayer->vv_verta=89;
++         if(g_Vars.currentplayer->vv_verta< -89)g_Vars.currentplayer->vv_verta=-89;
++         while(g_Vars.currentplayer->vv_theta<0)g_Vars.currentplayer->vv_theta+=360;
++         while(g_Vars.currentplayer->vv_theta>=360)g_Vars.currentplayer->vv_theta-=360;
++         g_Vars.currentplayer->swivelpos[0]=g_Vars.currentplayer->swivelpos[1]=0;
++         bgunSwivelWithoutDamp(0,0);return;
++        }
++#endif
+ 		// Adjust crosshair's position on screen
+ 		// when holding aim and moving stick
+ 		bgunSetAimType(0);
+ #ifndef PLATFORM_N64
++#ifdef __3DS__
++        if(pd_motion_allowed()){
++         float x=movedata.c1stickxraw*.65f/80.f,y=movedata.c1stickyraw*.65f/80.f;
++         float sx=PLAYER_EXTCFG().mouseaimspeedx*(320.f/1080.f)/g_Vars.currentplayer->aspect;
++         float sy=PLAYER_EXTCFG().mouseaimspeedy*(240.f/1080.f);
++         pd_controls_aim_reticle(&x,&y,movedata.freelookdx*sx,movedata.freelookdy*sy);
++         bgunSwivelWithoutDamp(x,y);return;
++        }
++#endif
+ 		if (allowmcross) {
+ 			// joystick is inactive, move crosshair using the mouse
+ 			const f32 xcoeff = 320.f / 1080.f;
+@@ -2528,6 +2575,9 @@ void bmoveUpdateHead(f32 arg0, f32 arg1, f32 arg2, Mtxf *arg3, f32 arg4)
+ 	}
+ 
+ 	bheadUpdate(sp244, arg2);
++#ifdef __3DS__
++ pd_controls_scope_head();
++#endif
+ 	mtx4LoadXRotation(BADDEG2RAD(360 - g_Vars.currentplayer->vv_verta360), &sp180);
+ 
+ 	if (optionsGetHeadRoll(g_Vars.currentplayerstats->mpindex)) {
+diff --git a/src/game/chraction.c b/src/game/chraction.c
+index 1ea0b8b..e73e155 100644
+--- a/src/game/chraction.c
++++ b/src/game/chraction.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "pd_runtime.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "game/acosfasinf.h"
+@@ -6531,6 +6534,10 @@ bool chrHasLosToTarget(struct chrdata *chr)
+ #if VERSION >= VERSION_JPN_FINAL
+ 	cansee = false;
+ 	prop = chrGetTargetProp(chr);
++#ifdef __3DS__
++ int pd_cached;
++ if(pd_guard_los_lookup(chr,prop,&pd_cached)){if(pd_cached)chrRecordLastVisibleTargetTime(chr);return pd_cached;}
++#endif
+ 
+ 	if (prop && prop->chr) {
+ 		cansee = chrHasLosToChr(chr, prop->chr, NULL);
+@@ -6541,6 +6548,10 @@ bool chrHasLosToTarget(struct chrdata *chr)
+ 	}
+ #else
+ 	prop = chrGetTargetProp(chr);
++#ifdef __3DS__
++ int pd_cached;
++ if(pd_guard_los_lookup(chr,prop,&pd_cached)){if(pd_cached)chrRecordLastVisibleTargetTime(chr);return pd_cached;}
++#endif
+ 	cansee = chrHasLosToChr(chr, prop->chr, NULL);
+ 
+ 	if (cansee) {
+@@ -6548,6 +6559,9 @@ bool chrHasLosToTarget(struct chrdata *chr)
+ 	}
+ #endif
+ 
++#ifdef __3DS__
++ pd_guard_los_store(chr,prop,cansee);
++#endif
+ 	return cansee;
+ }
+ 
+@@ -13314,6 +13328,9 @@ void chraTick(struct chrdata *chr)
+ 		u8 pass = race == RACE_HUMAN || race == RACE_SKEDAR;
+ 		chr->sleep = 0;
+ 
++#ifdef __3DS__
++        if(pd_guard_ai_tick(chr))
++#endif
+ 		chraiExecute(chr, PROPTYPE_CHR);
+ 
+ 		// Consider setting shootingatmelist
+diff --git a/src/game/game_1531a0.c b/src/game/game_1531a0.c
+index 6498881..ed2e25e 100644
+--- a/src/game/game_1531a0.c
++++ b/src/game/game_1531a0.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "pd_objectives.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "game/game_006900.h"
+@@ -391,6 +394,12 @@ Gfx *text0f153628(Gfx *gdl)
+ 	gDPSetTextureConvert(gdl++, G_TC_FILT);
+ 	gDPSetTextureLUT(gdl++, G_TT_NONE);
+ 
++#ifdef __3DS__
++	/* Independent menu passes use one LCD pixel per source font pixel. */
++	if (pd_bottom_ui_drawing || pd_top_ui_drawing) {
++		gDPSetTextureFilter(gdl++, G_TF_POINT);
++	} else
++#endif
+ 	if (var8007fad8) {
+ 		gDPSetTextureFilter(gdl++, G_TF_AVERAGE);
+ 	}
+@@ -490,12 +499,22 @@ Gfx *text0f153ab0(Gfx *gdl)
+ 
+ 	var8007fb9c = true;
+ 
++#ifdef __3DS__
++	// The projected walls use a deferred list, separate from menuRender's background.
++	allocation = gfxAllocate(sizeof(Gfx) * 532);
++#else
+ 	allocation = gfxAllocate(sizeof(Gfx) * 530);
++#endif
+ 
+ 	var800a4634 = allocation;
++#ifdef __3DS__
++	var800a4638 = allocation + 532;
++	gDPNoOpTag(var800a4634++, 0x50444d01);
++#else
+ 	var800a4638 = allocation + 530;
++#endif
+ 
+-	gSPDisplayList(gdl++, var800a4634);
++	gSPDisplayList(gdl++, allocation);
+ 
+ 	gdl = func0f0d4c80(gdl);
+ 
+@@ -509,6 +528,9 @@ void text0f153b40(void)
+ {
+ 	var8007fb9c = false;
+ 
++#ifdef __3DS__
++	gDPNoOpTag(var800a4634++, 0x50444d00);
++#endif
+ 	gSPEndDisplayList(var800a4634++);
+ }
+ 
+@@ -1888,6 +1910,11 @@ void text0f156030(u32 colour)
+ Gfx *textRenderProjected(Gfx *gdl, s32 *x, s32 *y, char *text, struct fontchar *chars, struct font *font,
+ 		s32 colour, s32 width, s32 height, s32 arg9, s32 lineheight)
+ {
++#ifdef __3DS__
++ if(pd_bottom_native_capturing)pd_bottom_native_text(*x,*y,text,chars,font,colour,width,height,arg9,lineheight);
++ if(pd_rendering_objectives)return pd_bottom_text(gdl,x,y,text,chars,font,colour,width,height,arg9,lineheight);
++#endif
++
+ 	s32 savedx;
+ 	s32 savedy;
+ 	u8 prevchar;
+@@ -2242,6 +2269,10 @@ Gfx *textRender(Gfx *gdl, s32 *x, s32 *y, char *text,
+ 		struct fontchar *chars, struct font *font, u32 arg6, u32 colour,
+ 		s32 width, s32 height, u32 arg10, s32 lineheight)
+ {
++#ifdef __3DS__
++ if(pd_bottom_native_capturing)pd_bottom_native_text(*x,*y,text,chars,font,arg6,width,height,0,lineheight);
++#endif
++
+ 	s32 savedx;
+ 	s32 savedy;
+ #if VERSION >= VERSION_PAL_BETA
+diff --git a/src/game/gamefile.c b/src/game/gamefile.c
+index ed6ac2c..7ffb515 100644
+--- a/src/game/gamefile.c
++++ b/src/game/gamefile.c
+@@ -406,7 +406,19 @@ s32 gamefileLoad(s32 device)
+ 	return -1;
+ }
+ 
++#ifdef __3DS__
++static s32 pdGamefileSave(s32 device,s32 fileid,u16 deviceserial);
++extern void pd_eeprom_batch_begin(void),pd_eeprom_batch_end(void);
++s32 gamefileSave(s32 device,s32 fileid,u16 deviceserial){
++ pd_eeprom_batch_begin();
++ s32 result=pdGamefileSave(device,fileid,deviceserial);
++ pd_eeprom_batch_end();
++ return result;
++}
++static s32 pdGamefileSave(s32 device,s32 fileid,u16 deviceserial)
++#else
+ s32 gamefileSave(s32 device, s32 fileid, u16 deviceserial)
++#endif
+ {
+ 	u32 value;
+ 	s32 newfileid;
+diff --git a/src/game/gfxmemory.c b/src/game/gfxmemory.c
+index be47a8f..a4408b5 100644
+--- a/src/game/gfxmemory.c
++++ b/src/game/gfxmemory.c
+@@ -12,6 +12,11 @@
+ #include "data.h"
+ #include "types.h"
+ #include "platform.h"
++#ifdef __3DS__
++#include <stdlib.h>
++#include <stdint.h>
++#include "system.h"
++#endif
+ 
+ /**
+  * This file handles memory usage for graphics related tasks.
+@@ -69,6 +74,37 @@ u32 g_VtxSizesByPlayerCount[] = {
+ s32 g_GfxNumSwapsPerBuffer[NUM_GFXTASKS] = {0, 1};
+ u32 g_GfxNumSwaps = 2;
+ 
++#ifdef __3DS__
++/* Extra native UI/model geometry may exceed the N64 stage's scratch budget.
++ * Spill storage follows the same two-frame lifetime as the existing arenas. */
++struct pd_gfx_spill {struct pd_gfx_spill *next;size_t size,used;unsigned char *data;};
++static struct pd_gfx_spill *pd_spills[NUM_GFXTASKS];
++static void pdGfxFreeSpills(unsigned index){
++ struct pd_gfx_spill *chunk=pd_spills[index];
++ while(chunk){struct pd_gfx_spill *next=chunk->next;free(chunk);chunk=next;}
++ pd_spills[index]=NULL;
++}
++static void *pdGfxAllocate(size_t size){
++ if(size>SIZE_MAX-15)sysFatalError("Graphics allocation size overflow");
++ size=(size+15)&~(size_t)15;
++ uintptr_t cursor=(uintptr_t)g_GfxMemPos,end=(uintptr_t)g_VtxBuffers[g_GfxActiveBufferIndex+1];
++ if(cursor<=end && size<=end-cursor){void *result=g_GfxMemPos;g_GfxMemPos+=size;return result;}
++ struct pd_gfx_spill *chunk=pd_spills[g_GfxActiveBufferIndex];
++ while(chunk && size>chunk->size-chunk->used)chunk=chunk->next;
++ if(!chunk){
++  size_t capacity=size>65536?size:65536;
++  if(capacity>SIZE_MAX-sizeof(*chunk)-15)sysFatalError("Graphics spill size overflow");
++  chunk=malloc(sizeof(*chunk)+15+capacity);
++  if(!chunk)sysFatalError("Graphics scratch exhausted requesting %lu bytes",(unsigned long)size);
++  chunk->size=capacity;chunk->used=0;
++  chunk->data=(unsigned char *)(((uintptr_t)(chunk+1)+15)&~(uintptr_t)15);
++  chunk->next=pd_spills[g_GfxActiveBufferIndex];pd_spills[g_GfxActiveBufferIndex]=chunk;
++  sysLogPrintf(0,"Graphics scratch spill: buffer=%u bytes=%lu",g_GfxActiveBufferIndex,(unsigned long)capacity);
++ }
++ void *result=chunk->data+chunk->used;chunk->used+=size;return result;
++}
++#endif
++
+ /**
+  * Allocate graphics memory from the heap. Presumably called on stage load.
+  *
+@@ -77,6 +113,9 @@ u32 g_GfxNumSwaps = 2;
+  */
+ void gfxReset(void)
+ {
++#ifdef __3DS__
++ for(unsigned i=0;i<NUM_GFXTASKS;i++)pdGfxFreeSpills(i);
++#endif
+ 	s32 stack;
+ 
+ 	if (argFindByPrefix(1, "-mgfx")) {
+@@ -135,19 +174,27 @@ Gfx *gfxGetMasterDisplayList(void)
+ 
+ Vtx *gfxAllocateVertices(u32 count)
+ {
++#ifdef __3DS__
++ return pdGfxAllocate((size_t)count*sizeof(Vtx));
++#else
+ 	void *ptr = g_GfxMemPos;
+ 	g_GfxMemPos += count * sizeof(Vtx);
+ 	g_GfxMemPos = (u8 *)ALIGN16((uintptr_t)g_GfxMemPos);
+ 
+ 	return ptr;
++#endif
+ }
+ 
+ void *gfxAllocateMatrix(void)
+ {
++#ifdef __3DS__
++ return pdGfxAllocate(sizeof(Mtx));
++#else
+ 	void *ptr = g_GfxMemPos;
+ 	g_GfxMemPos += sizeof(Mtx);
+ 
+ 	return ptr;
++#endif
+ }
+ 
+ /**
+@@ -157,6 +204,13 @@ void *gfxAllocateMatrix(void)
+  */
+ LookAt *gfxAllocateLookAt(s32 count)
+ {
++#ifdef __3DS__
++#ifdef PLATFORM_64BIT
++ return pdGfxAllocate((size_t)count*(sizeof(LookAt)*2));
++#else
++ return pdGfxAllocate((size_t)count*(sizeof(LookAt)/2));
++#endif
++#else
+ 	void *ptr = g_GfxMemPos;
+ #ifdef PLATFORM_64BIT
+ 	g_GfxMemPos += count * (sizeof(LookAt) * 2);
+@@ -165,29 +219,41 @@ LookAt *gfxAllocateLookAt(s32 count)
+ #endif
+ 
+ 	return ptr;
++#endif
+ }
+ 
+ Col *gfxAllocateColours(s32 count)
+ {
++#ifdef __3DS__
++ return pdGfxAllocate((size_t)count*sizeof(Col));
++#else
+ 	void *ptr = g_GfxMemPos;
+ 	count = ALIGN16(count * sizeof(Col));
+ 	g_GfxMemPos += count;
+ 
+ 	return ptr;
++#endif
+ }
+ 
+ void *gfxAllocate(u32 size)
+ {
++#ifdef __3DS__
++ return pdGfxAllocate(size);
++#else
+ 	void *ptr = g_GfxMemPos;
+ 	size = ALIGN16(size);
+ 	g_GfxMemPos += size;
+ 
+ 	return ptr;
++#endif
+ }
+ 
+ void gfxSwapBuffers(void)
+ {
+ 	g_GfxActiveBufferIndex ^= 1;
++#ifdef __3DS__
++ pdGfxFreeSpills(g_GfxActiveBufferIndex);
++#endif
+ 	g_GfxRequestedDisplayList = false;
+ 	g_GfxMemPos = g_VtxBuffers[g_GfxActiveBufferIndex];
+ 	g_GfxNumSwapsPerBuffer[g_GfxActiveBufferIndex] = g_GfxNumSwaps;
+diff --git a/src/game/lv.c b/src/game/lv.c
+index 8db23f1..d2d1655 100644
+--- a/src/game/lv.c
++++ b/src/game/lv.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "pd_objectives.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "bss.h"
+@@ -1065,7 +1068,13 @@ Gfx *lvRender(Gfx *gdl)
+ 		gdl = vi0000b1d0(gdl);
+ 		gdl = viRenderViewportEdges(gdl);
+ 		gdl = bgScissorToViewport(gdl);
+-		gdl = menuRender(gdl);
++		#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445501);
++#endif
++ gdl = menuRender(gdl);
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445500);
++#endif
+ 	} else if (g_Vars.stagenum == STAGE_4MBMENU) {
+ 		gSPClipRatio(gdl++, FRUSTRATIO_2);
+ 		gSPDisplayList(gdl++, &var800613a0);
+@@ -1090,7 +1099,13 @@ Gfx *lvRender(Gfx *gdl)
+ 
+ 		gdl = vi0000b1d0(gdl);
+ 		gdl = bgScissorToViewport(gdl);
+-		gdl = menuRender(gdl);
++		#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445501);
++#endif
++ gdl = menuRender(gdl);
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445500);
++#endif
+ 
+ 		if (g_Vars.currentplayer->pausemode != PAUSEMODE_UNPAUSED) {
+ 			playerTickPauseMenu();
+@@ -1226,7 +1241,13 @@ Gfx *lvRender(Gfx *gdl)
+ 				mtx00016748(1);
+ 
+ 				if (g_Vars.currentplayer->menuisactive) {
+-					gdl = menuRender(gdl);
++					#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445501);
++#endif
++ gdl = menuRender(gdl);
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445500);
++#endif
+ 				}
+ 			} else {
+ 				if (var80075d60 == 2) {
+@@ -1234,7 +1255,15 @@ Gfx *lvRender(Gfx *gdl)
+ 				}
+ 
+ 				gdl = viRenderViewportEdges(gdl);
+-				gdl = skyRender(gdl);
++				#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50444601);
++#endif
++ gDPNoOpTag(gdl++,0x50445301);
++ gdl = skyRender(gdl);
++ gDPNoOpTag(gdl++,0x50445300);
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50444600);
++#endif
+ 				bgTick();
+ 				lightsTick();
+ 				propsTickPlayer(islastplayer);
+@@ -1381,7 +1410,13 @@ Gfx *lvRender(Gfx *gdl)
+ 				}
+ 
+ 				if (var80075d60 == 2) {
+-					gdl = playerRenderHud(gdl);
++					#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445501);
++#endif
++ gdl = playerRenderHud(gdl);
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445500);
++#endif
+ 
+ #ifdef DEBUG
+ 					gdl = lvRenderManPosIfEnabled(gdl);
+@@ -1659,15 +1694,33 @@ Gfx *lvRender(Gfx *gdl)
+ 				}
+ 
+ #if VERSION >= VERSION_NTSC_1_0
+-				gdl = scenarioRenderHud(gdl);
++				#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445501);
++#endif
++ gdl = scenarioRenderHud(gdl);
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445500);
++#endif
+ 				gdl = lvRenderFade(gdl);
+ #else
+ 				gdl = lvRenderFade(gdl);
+-				gdl = scenarioRenderHud(gdl);
++				#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445501);
++#endif
++ gdl = scenarioRenderHud(gdl);
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445500);
++#endif
+ #endif
+ 
+ 				if (g_FrIsValidWeapon) {
+-					gdl = frRenderHud(gdl);
++					#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445501);
++#endif
++ gdl = frRenderHud(gdl);
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445500);
++#endif
+ 				}
+ 
+ 				if (debugGetTilesDebugMode() != 0
+@@ -1707,7 +1760,13 @@ Gfx *lvRender(Gfx *gdl)
+ 				mtx00016748(1);
+ 
+ 				if (g_Vars.currentplayer->menuisactive) {
+-					gdl = menuRender(gdl);
++					#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445501);
++#endif
++ gdl = menuRender(gdl);
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50445500);
++#endif
+ 				}
+ 
+ 				mtx00016748(g_Vars.currentplayerstats->scale_bg2gfx);
+@@ -1793,6 +1852,10 @@ Gfx *lvRender(Gfx *gdl)
+ 	}
+ #endif
+ 
++#ifdef __3DS__
++	gdl = pd_render_bottom_objectives(gdl);
++#endif
++
+ #if VERSION < VERSION_NTSC_1_0
+ 	if ((uintptr_t)gdl < (uintptr_t)g_GfxBuffers[g_GfxActiveBufferIndex]
+ 			|| (uintptr_t)gdl > (uintptr_t)g_GfxBuffers[g_GfxActiveBufferIndex + 1]) {
+diff --git a/src/game/mainmenu.c b/src/game/mainmenu.c
+index a69146c..96e3946 100644
+--- a/src/game/mainmenu.c
++++ b/src/game/mainmenu.c
+@@ -99,7 +99,7 @@ MenuItemHandlerResult menuhandlerControlStyleImpl(s32 operation, struct menuitem
+ 		break;
+ 	case MENUOP_GETOPTIONTEXT:
+ 		if (data->list.value > 7) {
+-			return (uintptr_t) "Ext";
++			return (uintptr_t) "3DS Dual Stick";
+ 		} else {
+ 			return (uintptr_t) langGet(g_ControlStyleOptions[data->list.value]);
+ 		}
+@@ -3524,7 +3524,7 @@ struct menuitem g_SoloMissionOptionsMenuItems[] = {
+ 		MENUITEMTYPE_SELECTABLE,
+ 		0,
+ 		MENUITEMFLAG_SELECTABLE_OPENSDIALOG | MENUITEMFLAG_BIGFONT | MENUITEMFLAG_LITERAL_TEXT,
+-		(uintptr_t)"Extended\n",
++		(uintptr_t)"3DS Options\n",
+ 		0,
+ 		(void *)&g_ExtendedMenuDialog,
+ 	},
+@@ -3570,7 +3570,7 @@ struct menuitem g_2PMissionOptionsHMenuItems[] = {
+ 		MENUITEMTYPE_SELECTABLE,
+ 		0,
+ 		MENUITEMFLAG_SELECTABLE_OPENSDIALOG | MENUITEMFLAG_LITERAL_TEXT,
+-		(uintptr_t)"Extended\n",
++		(uintptr_t)"3DS Options\n",
+ 		0,
+ 		(void *)&g_ExtendedMenuDialog,
+ 	},
+@@ -3636,7 +3636,7 @@ struct menuitem g_2PMissionOptionsVMenuItems[] = {
+ 		MENUITEMTYPE_SELECTABLE,
+ 		0,
+ 		MENUITEMFLAG_SELECTABLE_OPENSDIALOG | MENUITEMFLAG_LITERAL_TEXT,
+-		(uintptr_t)"Extended\n",
++		(uintptr_t)"3DS Options\n",
+ 		0,
+ 		(void *)&g_ExtendedMenuDialog,
+ 	},
+@@ -3714,7 +3714,7 @@ struct menuitem g_CiOptionsMenuItems[] = {
+ 		MENUITEMTYPE_SELECTABLE,
+ 		0,
+ 		MENUITEMFLAG_SELECTABLE_OPENSDIALOG | MENUITEMFLAG_BIGFONT | MENUITEMFLAG_LITERAL_TEXT,
+-		(uintptr_t)"Extended\n",
++		(uintptr_t)"3DS Options\n",
+ 		7,
+ 		(void *)&g_ExtendedMenuDialog,
+ 	},
+@@ -3950,8 +3950,14 @@ MenuDialogHandlerResult inventoryMenuDialog(s32 operation, struct menudialogdef
+ 	if (operation == MENUOP_TICK) {
+ 		if (g_Menus[g_MpPlayerNum].curdialog && g_Menus[g_MpPlayerNum].curdialog->definition == dialogdef) {
+ 			g_Menus[g_MpPlayerNum].menumodel.zoomtimer60 -= g_Vars.diffframe60;
+-			g_Menus[g_MpPlayerNum].menumodel.newroty = 18.849555969238f * g_20SecIntervalFrac;
+-			g_Menus[g_MpPlayerNum].menumodel.curroty = 18.849555969238f * g_20SecIntervalFrac;
++#ifdef __3DS__
++            extern float pd_menu_spin_angle(void);
++            float angle=pd_menu_spin_angle();
++#else
++            float angle=18.849555969238f*g_20SecIntervalFrac;
++#endif
++            g_Menus[g_MpPlayerNum].menumodel.newroty=angle;
++            g_Menus[g_MpPlayerNum].menumodel.curroty=angle;
+ 			g_Menus[g_MpPlayerNum].menumodel.currotz = 0;
+ 			g_Menus[g_MpPlayerNum].menumodel.newrotz = 0;
+ 
+diff --git a/src/game/menu.c b/src/game/menu.c
+index 256085a..79133f4 100644
+--- a/src/game/menu.c
++++ b/src/game/menu.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "pd_objectives.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "../lib/naudio/n_sndp.h"
+@@ -1761,6 +1764,10 @@ void menuUpdateCurFrame(void)
+ 
+ void menuPopDialog(void)
+ {
++#ifdef __3DS__
++ /* A second back/decline in the same frame must not close the root twice. */
++ if(g_MpPlayerNum<0 || g_MpPlayerNum>=MAX_PLAYERS || g_Menus[g_MpPlayerNum].depth<=0)return;
++#endif
+ 	menuCloseDialog();
+ 	menuUpdateCurFrame();
+ }
+@@ -1834,11 +1841,66 @@ void menuUnsetModel(struct menumodel *menumodel)
+ 
+ Lights1 var80071468 = gdSPDefLights1(0x96, 0x96, 0x96, 0xff, 0xff, 0xff, 0xb2, 0x4d, 0x2e);
+ 
++#ifdef __3DS__
++/* Frame-owned geometry and projection from the original inventory render.
++ * Reusing these does not load a model or advance its animation a second time. */
++static Gfx *pd_inventory_geometry;
++static Gfx pd_inventory_projection[2];
++static int pd_inventory_rect[4];
++static bool pd_inventory_layout;
++static float pd_inventory_crop[2];
++static uintptr_t pd_inventory_model_id;
++static float pd_inventory_source_scale=1.f;
++float pd_bottom_model_scale(void){return pd_inventory_source_scale;}
++void pd_bottom_model_source(float *w,float *h,uintptr_t *id){
++ *w=pd_inventory_crop[0];*h=pd_inventory_crop[1];*id=pd_inventory_model_id;
++}
++static Gfx *pdRenderInventoryPreview(Gfx *gdl)
++{
++ if(!pd_inventory_geometry || pd_inventory_rect[2]<=0 || pd_inventory_rect[3]<=0)return gdl;
++ Vp *vp=gfxAllocate(sizeof(Vp));
++ int x=pd_inventory_rect[0],y=pd_inventory_rect[1];
++ int w=pd_inventory_rect[2],h=pd_inventory_rect[3];
++ memset(vp,0,sizeof(*vp));
++ vp->vp.vscale[0]=w*2;vp->vp.vscale[1]=h*2;vp->vp.vscale[2]=511;
++ vp->vp.vtrans[0]=x*4+w*2;vp->vp.vtrans[1]=y*4+h*2;vp->vp.vtrans[2]=511;
++ gSPViewport(gdl++,osVirtualToPhysical(vp));
++ *gdl++=pd_inventory_projection[0];*gdl++=pd_inventory_projection[1];
++
++ gDPSetScissor(gdl++,G_SC_NON_INTERLACE,x,y,x+w,y+h);
++ gDPNoOpTag(gdl++,0x50444901);
++ gSPDisplayList(gdl++,var80061380);gSPDisplayList(gdl++,var800613a0);
++ gSPDisplayList(gdl++,pd_inventory_geometry);
++ gDPNoOpTag(gdl++,0x50444902);
++ gSPDisplayList(gdl++,var80061380);gSPDisplayList(gdl++,var800613a0);
++ gSPDisplayList(gdl++,pd_inventory_geometry);
++ gDPNoOpTag(gdl++,0x50444900);
++ gSPClearGeometryMode(gdl++,G_ZBUFFER | G_CULL_BOTH);
++ gdl=func0f0d479c(gdl);
++ gSPDisplayList(gdl++,var800613a0);
++ gdl=menuApplyScissor(gdl);
++ return gdl;
++}
++#endif
++
+ /**
+  * Render the hudpiece as well as any models within dialogs.
+  */
+ Gfx *menuRenderModel(Gfx *gdl, struct menumodel *menumodel, s32 modeltype)
+ {
++#ifdef __3DS__
++ extern struct rend_vidat *g_ViBackData;
++ extern Vp *var80070f10;
++ static int top_model_active;
++ if(pd_top_ui_drawing && !top_model_active){
++  struct rend_vidat vi=*g_ViBackData;Vp *viewport=var80070f10;
++  top_model_active=1;gdl=menuRenderModel(gdl,menumodel,modeltype);top_model_active=0;
++  *g_ViBackData=vi;var80070f10=viewport;
++  return func0f0d479c(gdl);
++ }
++ // Rendering the second menu must not tick/load the inventory model twice.
++ if(pd_bottom_ui_drawing)return modeltype==MENUMODELTYPE_DEFAULT?pdRenderInventoryPreview(gdl):gdl;
++#endif
+ 	f32 rotx;
+ 	f32 roty;
+ 	f32 rotz;
+@@ -2338,6 +2400,9 @@ Gfx *menuRenderModel(Gfx *gdl, struct menumodel *menumodel, s32 modeltype)
+ 				s32 x2 = (s32)(center + width * 0.5f);
+ #endif
+ 
++#ifdef __3DS__
++                if(pd_top_ui_drawing){x1=g_MenuScissorX1;x2=g_MenuScissorX2;}
++#endif
+ 				f32 aspect = (f32) (x2 - x1) / (f32) (g_MenuScissorY2 - g_MenuScissorY1);
+ 
+ 				static u32 znear = 10;
+@@ -2352,7 +2417,17 @@ Gfx *menuRenderModel(Gfx *gdl, struct menumodel *menumodel, s32 modeltype)
+ 				viSetFovAspectAndSize(g_Vars.currentplayer->fovy, aspect, (x2 - x1) * g_ScaleX, g_MenuScissorY2 - g_MenuScissorY1);
+ 
+ 				gdl = vi0000af00(gdl, var800a2048[g_MpPlayerNum]);
+-				gdl = vi0000aca4(gdl, znear, zfar);
++#ifdef __3DS__
++                Gfx *projection=gdl;
++#endif
++                gdl = vi0000aca4(gdl, znear, zfar);
++#ifdef __3DS__
++                if(menumodel==&g_Menus[0].menumodel){
++                 pd_inventory_projection[0]=projection[0];pd_inventory_projection[1]=projection[1];
++                 pd_inventory_crop[0]=viGetViewWidth();
++                 pd_inventory_crop[1]=viGetViewHeight();
++                }
++#endif
+ 			}
+ 		}
+ 
+@@ -2466,7 +2541,10 @@ Gfx *menuRenderModel(Gfx *gdl, struct menumodel *menumodel, s32 modeltype)
+ 			}
+ 		}
+ 
+-		gSPSetLights1(gdl++, var80071468);
++#ifdef __3DS__
++        Gfx *preview_begin=gdl;
++#endif
++        gSPSetLights1(gdl++, var80071468);
+ 
+ #ifdef AVOID_UB
+ 		// during the credits camGetLookAt() can return NULL
+@@ -2485,9 +2563,19 @@ Gfx *menuRenderModel(Gfx *gdl, struct menumodel *menumodel, s32 modeltype)
+ 
+ 		modelRender(&renderdata, &menumodel->bodymodel);
+ 
+-		gdl = renderdata.gdl;
++        gdl = renderdata.gdl;
++#ifdef __3DS__
++        if(modeltype==MENUMODELTYPE_DEFAULT && menumodel==&g_Menus[0].menumodel){
++         pd_inventory_model_id=(uintptr_t)menumodel->bodymodeldef ^ ((uintptr_t)menumodel->curparams<<1);
++         pd_inventory_source_scale=scale;
++         size_t count=gdl-preview_begin;
++         pd_inventory_geometry=gfxAllocate((count+1)*sizeof(Gfx));
++         memcpy(pd_inventory_geometry,preview_begin,count*sizeof(Gfx));
++         gSPEndDisplayList(&pd_inventory_geometry[count]);
++        }
++#endif
+ 
+-		mtx00016760();
++        mtx00016760();
+ 
+ 		for (i = 0; i < menumodel->bodymodeldef->nummatrices; i++) {
+ 			Mtxf sp70;
+@@ -2900,11 +2988,20 @@ Gfx *dialogRender(Gfx *gdl, struct menudialog *dialog, struct menu *menu, bool l
+ 
+ 			gSPClearGeometryMode(gdl++, G_ZBUFFER);
+ 
++#ifdef __3DS__
++            if(!pd_bottom_ui_drawing && !pd_top_ui_drawing){
++#endif
+ 			viSetViewPosition(g_Vars.currentplayer->viewleft, g_Vars.currentplayer->viewtop);
+ 			viSetFovAspectAndSize(g_Vars.currentplayer->fovy, g_Vars.currentplayer->aspect,
+ 					g_Vars.currentplayer->viewwidth, g_Vars.currentplayer->viewheight);
++#ifdef __3DS__
++            }
++#endif
+ 		}
+ 
++#ifdef __3DS__
++        if(!lightweight && g_Menus[0].curdialog==dialog)pd_bottom_native_begin(dialog);
++#endif
+ 		// Render menu items
+ 		if (dialog->type != 0 || dialog->transitionfrac >= 0.0f) {
+ 			u32 stack;
+@@ -2931,7 +3028,11 @@ Gfx *dialogRender(Gfx *gdl, struct menudialog *dialog, struct menu *menu, bool l
+ 
+ 				colindex = dialog->colstart + i;
+ 
+-				if (i != 0 && (dialog->definition->flags & MENUDIALOGFLAG_0400) == 0) {
++				if (i != 0 && (dialog->definition->flags & MENUDIALOGFLAG_0400) == 0
++#ifdef __3DS__
++                    && !(pd_bottom_ui_drawing && pd_inventory_layout)
++#endif
++                    ) {
+ 					gdl = menugfxDrawFilledRect(gdl, curx - 1, dialogtop + LINEHEIGHT + 1, curx, dialogbottom, sp120, sp120);
+ 				}
+ 
+@@ -2969,6 +3070,21 @@ Gfx *dialogRender(Gfx *gdl, struct menudialog *dialog, struct menu *menu, bool l
+ 					context.y = cury;
+ 					context.width = colwidth;
+ 					context.height = menu->rows[rowindex].height;
++#ifdef __3DS__
++                    if(pd_bottom_ui_drawing && pd_inventory_layout){
++                     context.x=134;context.width=168;
++                     switch(menu->rows[rowindex].itemindex){
++                      case 0:context.x=16;context.width=110;context.y=22;context.height=204;break;
++                      case 1:context.y=22;context.height=18;break;
++                      case 2:context.y=40;context.height=18;break;
++                      case 3:context.y=60;context.height=112;break;
++                      case 4:context.y=174;context.height=18;break;
++                      case 5:context.y=192;context.height=18;break;
++                      case 6:context.y=212;context.height=20;break;
++                     }
++                    }
++#endif
++
+ 
+ 					if (context.y + context.height < dialogtop + LINEHEIGHT + 1) {
+ 						offscreen = true;
+@@ -2987,6 +3103,9 @@ Gfx *dialogRender(Gfx *gdl, struct menudialog *dialog, struct menu *menu, bool l
+ 						context.data = itemdata;
+ 						context.focused = focused;
+ 						context.dialog = dialog;
++#ifdef __3DS__
++                        pd_bottom_native_context(&context);
++#endif
+ 
+ 						if (prevwaslist) {
+ 							gdl = menugfxDrawFilledRect(gdl, context.x, context.y - 1, context.x + context.width, context.y, sp120, sp120);
+@@ -3061,6 +3180,10 @@ Gfx *dialogRender(Gfx *gdl, struct menudialog *dialog, struct menu *menu, bool l
+ 							}
+ 						}
+ 
++#ifdef __3DS__
++                        if(item->type==MENUITEMTYPE_SELECTABLE || item->type==MENUITEMTYPE_DROPDOWN || item->type==MENUITEMTYPE_CHECKBOX || item->type==MENUITEMTYPE_SLIDER)
++                            pd_bottom_native_hit(&context,-1,context.y,context.height);
++#endif
+ 						gdl = menuitemRender(gdl, &context);
+ 
+ 						if (item->type == MENUITEMTYPE_LIST) {
+@@ -3206,6 +3329,9 @@ Gfx *dialogRender(Gfx *gdl, struct menudialog *dialog, struct menu *menu, bool l
+ 		}
+ 	}
+ 
++#ifdef __3DS__
++    if(g_Menus[0].curdialog==dialog)pd_bottom_native_end();
++#endif
+ 	return gdl;
+ }
+ 
+@@ -3755,9 +3881,16 @@ void func0f0f85e0(struct menudialogdef *dialogdef, s32 root)
+ }
+ 
+ u32 g_MenuCThresh = 120;
++#ifdef __3DS__
++static Gfx *pdRenderTopNativeDialog(Gfx *,struct menudialog *,struct menu *,bool);
++#endif
+ 
+ Gfx *menuRenderDialog(Gfx *gdl, struct menudialog *dialog, struct menu *menu, bool lightweight)
+ {
++#ifdef __3DS__
++ if(!pd_bottom_ui_drawing && !pd_top_ui_drawing && dialog && dialog->numcols)
++  return pdRenderTopNativeDialog(gdl,dialog,menu,lightweight);
++#endif
+ 	mainOverrideVariable("cthresh", &g_MenuCThresh);
+ 
+ 	textSetWaveBlend(dialog->unk54, dialog->unk58, g_MenuCThresh);
+@@ -3769,6 +3902,76 @@ Gfx *menuRenderDialog(Gfx *gdl, struct menudialog *dialog, struct menu *menu, bo
+ 	return gdl;
+ }
+ 
++#ifdef __3DS__
++/* Preserve logical tick/input geometry, but render dialog content in LCD pixels.
++ * Fonts, row heights and scrolling offsets stay native instead of being stretched. */
++static int pdTopCoordinate(int value,int target,int source){
++ int scaled=value*target;
++ return (scaled+(scaled<0?-source/2:source/2))/source;
++}
++static Gfx *pdRenderTopNativeDialog(Gfx *gdl,struct menudialog *dialog,struct menu *menu,bool lightweight)
++{
++ extern struct rend_vidat *g_ViBackData;
++ extern Vp *var80070f10;
++ extern Gfx *var800a4638;
++ extern void pd_top_menu_layout_report(int,int,int,int,int,int,int) __attribute__((weak));
++ struct rend_vidat vi=*g_ViBackData;
++ if(vi.x<=0 || vi.y<=0)return gdl;
++ int width=videoGetDisplayModeIndex()==1?320:400;
++ struct menudialog original=*dialog;
++ struct menucolumn columns[ARRAYCOUNT(menu->cols)];memcpy(columns,menu->cols,sizeof columns);
++ Vp *viewport=var80070f10;
++ Gfx *planes=var800a4634,*plane_end=var800a4638;
++ int scale=g_ScaleX,projectx=g_MenuProjectFromX,projecty=g_MenuProjectFromY;
++ int clip[]={g_MenuScissorX1,g_MenuScissorY1,g_MenuScissorX2,g_MenuScissorY2,
++  g_ScissorX1,g_ScissorY1,g_ScissorX2,g_ScissorY2,var8009de90,var8009de94};
++ if(pd_top_menu_layout_report)pd_top_menu_layout_report(vi.x,vi.y,dialog->x,dialog->y,dialog->width,dialog->height,2);
++ int source_width=vi.x/(scale?scale:1);
++ dialog->x=pdTopCoordinate(original.x,width,source_width);
++ dialog->y=pdTopCoordinate(original.y,240,vi.y);
++ dialog->width=pdTopCoordinate(original.x+original.width,width,source_width)-dialog->x;
++ dialog->height=pdTopCoordinate(original.y+original.height,240,vi.y)-dialog->y;
++ dialog->dstx=pdTopCoordinate(original.dstx,width,source_width);
++ dialog->dsty=pdTopCoordinate(original.dsty,240,vi.y);
++ dialog->dstwidth=pdTopCoordinate(original.dstwidth,width,source_width);
++ dialog->dstheight=pdTopCoordinate(original.dstheight,240,vi.y);
++ dialog->contentwidth=pdTopCoordinate(original.contentwidth,width,source_width);
++ int edge=0;
++ for(unsigned i=0;i<dialog->numcols;i++){
++  unsigned index=dialog->colstart+i;
++  int right=edge+columns[index].width;
++  menu->cols[index].width=pdTopCoordinate(right,width,source_width)-pdTopCoordinate(edge,width,source_width);
++  edge=right;
++ }
++ pd_top_ui_drawing=1;g_ScaleX=1;
++ g_ViBackData->x=g_ViBackData->bufx=g_ViBackData->viewx=width;
++ g_ViBackData->y=g_ViBackData->bufy=g_ViBackData->viewy=240;
++ g_ViBackData->viewleft=g_ViBackData->viewtop=0;g_ViBackData->aspect=(float)width/240.f;
++ g_MenuProjectFromX=pdTopCoordinate(projectx,width,source_width);
++ g_MenuProjectFromY=pdTopCoordinate(projecty,240,vi.y);
++ var80070f10=NULL; /* Never modify a Vp already referenced by the world pass. */
++ gDPNoOpTag(gdl++,width==320?0x50445403:0x50445401);
++ gdl=func0f0d479c(gdl);
++ gSPDisplayList(gdl++,var800613a0);
++ gDPSetScissor(gdl++,G_SC_NON_INTERLACE,0,0,width,240);
++ if(pd_top_menu_layout_report)pd_top_menu_layout_report(width,240,dialog->x,dialog->y,dialog->width,dialog->height,0);
++ /* Projected backgrounds are deferred. Give this coordinate pass its own
++  * list and finish it before restoring the outer list cursor. */
++ gdl=text0f153ab0(gdl);
++ gdl=menuRenderDialog(gdl,dialog,menu,lightweight);
++ text0f153b40();
++ gDPNoOpTag(gdl++,0x50445400);
++ *dialog=original;memcpy(menu->cols,columns,sizeof columns);
++ *g_ViBackData=vi;var80070f10=viewport;var800a4634=planes;var800a4638=plane_end;
++ g_ScaleX=scale;g_MenuProjectFromX=projectx;g_MenuProjectFromY=projecty;
++ g_MenuScissorX1=clip[0];g_MenuScissorY1=clip[1];g_MenuScissorX2=clip[2];g_MenuScissorY2=clip[3];
++ g_ScissorX1=clip[4];g_ScissorY1=clip[5];g_ScissorX2=clip[6];g_ScissorY2=clip[7];
++ var8009de90=clip[8];var8009de94=clip[9];pd_top_ui_drawing=0;
++ if(pd_top_menu_layout_report)pd_top_menu_layout_report(vi.x,vi.y,dialog->x,dialog->y,dialog->width,dialog->height,1);
++ return gdl;
++}
++#endif
++
+ const char var7f1b2700[] = "[]-[] slide from %d";
+ const char var7f1b2714[] = " to %d\n";
+ const char var7f1b271c[] = "UNPAUSE: enabling control 0\n";
+@@ -5411,8 +5614,170 @@ Gfx *menuRenderBackgroundLayer2(Gfx *gdl, u8 bg, f32 frac)
+ 	return gdl;
+ }
+ 
++
++#ifdef __3DS__
++/* A separate menu pass, laid out in bottom-LCD pixels. No top vertices or
++ * framebuffer are replayed and no fit/zoom matrix is used. */
++/* Startup reads the original palette without needing menu/game state. */
++void pd_menu_default_theme(u32 palette[6])
++{
++ const struct menucolourpalette *p=&g_MenuColours[MENUDIALOGTYPE_DEFAULT];
++ palette[0]=p->dialog_border1;palette[1]=p->dialog_titlebg;
++ palette[2]=p->dialog_border2;palette[3]=p->dialog_titlefg;
++ palette[4]=p->dialog_bodybg;palette[5]=p->item_unfocused;
++}
++static char *pdBottomWindowTitle(struct menudialogdef *definition)
++{
++ if(definition->type==MENUDIALOGTYPE_DEFAULT && pd_bottom_mission_panel_visible())
++  return langGet(g_SoloStages[g_MissionConfig.stageindex].name3);
++ return "Perfect Engine Launcher\n";
++}
++static Gfx *pdRenderBottomDialogPass(Gfx *gdl, int mode)
++{
++ extern struct rend_vidat *g_ViBackData;
++ extern Vp *var80070f10;
++ extern Gfx *var800a4638;
++ extern u64 g_RngSeed;
++ extern u32 g_GfxNumSwaps;
++ static u32 bottom_frame=~0u;
++ if(bottom_frame==g_GfxNumSwaps)return gdl;
++ bottom_frame=g_GfxNumSwaps;
++ if(!pd_bottom_refresh_due()){
++  /* Retain completed pixels; no dialog layout, glyphs or geometry this frame. */
++  gDPNoOpTag(gdl++,0x50445200);return gdl;
++ }
++ u64 saved_rng=g_RngSeed;
++ struct menu *menu=&g_Menus[0];struct menudialog *dialog=menu->curdialog;
++ bool objectives=mode==1 || (!dialog && pd_bottom_mission_panel_visible());
++ bool standalone=mode!=0 || !dialog || dialog->state==MENUDIALOGSTATE_PREOPEN;
++ static struct menuitem objective_items[]={{MENUITEMTYPE_END}};
++ static struct menudialogdef objective_def={MENUDIALOGTYPE_DEFAULT,(uintptr_t)&pdBottomWindowTitle,objective_items,NULL,MENUDIALOGFLAG_DISABLEITEMSCROLL,NULL};
++ struct menudialog objective_dialog={0};
++ if(standalone){
++  objective_dialog.definition=&objective_def;
++  objective_dialog.type=objective_dialog.type2=MENUDIALOGTYPE_DEFAULT;
++  objective_dialog.state=MENUDIALOGSTATE_POPULATED;
++  objective_dialog.transitionfrac=-1.f;objective_dialog.redrawtimer=-1.f;
++  dialog=&objective_dialog;
++ }
++ if(!dialog || !dialog->definition || dialog->state==MENUDIALOGSTATE_PREOPEN)return gdl;
++ struct menu saved=*menu;
++ s32 saved_player=g_MpPlayerNum;g_MpPlayerNum=0;
++ if(standalone){
++  /* dialogRender inspects the current layer even for a read-only window. */
++  menu->depth=1;menu->layers[0].numsiblings=0;
++ }
++ struct rend_vidat vi=*g_ViBackData;
++ Vp *saved_viewport=var80070f10;
++ Gfx *saved_planes=var800a4634,*saved_plane_end=var800a4638;
++ s32 saved_scale=g_ScaleX,saved_project_x=g_MenuProjectFromX,saved_project_y=g_MenuProjectFromY;
++ s32 clip[]={g_MenuScissorX1,g_MenuScissorY1,g_MenuScissorX2,g_MenuScissorY2,
++  g_ScissorX1,g_ScissorY1,g_ScissorX2,g_ScissorY2,var8009de90,var8009de94};
++ pd_bottom_text_overlay=0;
++ pd_bottom_standalone_window(standalone);
++ pd_bottom_ui_drawing=1;g_ScaleX=1;
++ g_ViBackData->x=g_ViBackData->bufx=g_ViBackData->viewx=320;
++ g_ViBackData->y=g_ViBackData->bufy=g_ViBackData->viewy=240;
++ g_ViBackData->viewleft=g_ViBackData->viewtop=0;g_ViBackData->aspect=4.f/3.f;
++ dialog->x=dialog->dstx=14;dialog->y=dialog->dsty=8;
++ dialog->width=dialog->dstwidth=292;dialog->height=dialog->dstheight=224;
++ int total=0,left=290;
++ for(int i=0;i<dialog->numcols;i++)total+=menu->cols[dialog->colstart+i].width;
++ for(int i=0;i<dialog->numcols;i++){
++  struct menucolumn *col=&menu->cols[dialog->colstart+i];
++  int width=i==dialog->numcols-1?left:total?col->width*290/total:290/dialog->numcols;
++  col->width=width;left-=width;
++  int used=0,flex=0,controls=0;
++  for(int j=0;j<col->numrows;j++){
++   struct menurow *row=&menu->rows[col->rowstart+j];
++   int type=dialog->definition->items[row->itemindex].type;
++   if(row->height<=0)continue;
++   if(type==MENUITEMTYPE_KEYBOARD)row->height=194;
++   if(type==MENUITEMTYPE_LABEL && row->height<12)row->height=12;
++   if(type==MENUITEMTYPE_MARQUEE && row->height<14)row->height=14;
++   if(type==MENUITEMTYPE_MODEL || type==MENUITEMTYPE_LIST || type==MENUITEMTYPE_SCROLLABLE)flex++;
++   else if(type==MENUITEMTYPE_SELECTABLE || type==MENUITEMTYPE_DROPDOWN
++     || type==MENUITEMTYPE_CHECKBOX || type==MENUITEMTYPE_SLIDER)controls++;
++   used+=row->height;
++  }
++  int spare=204-used;
++  if(spare>0){
++   for(int j=0;j<col->numrows;j++){
++    struct menurow *row=&menu->rows[col->rowstart+j];
++    int type=dialog->definition->items[row->itemindex].type;
++    if(row->height<=0)continue;
++    bool flexible=type==MENUITEMTYPE_MODEL || type==MENUITEMTYPE_LIST || type==MENUITEMTYPE_SCROLLABLE;
++    bool control=type==MENUITEMTYPE_SELECTABLE || type==MENUITEMTYPE_DROPDOWN
++     || type==MENUITEMTYPE_CHECKBOX || type==MENUITEMTYPE_SLIDER;
++    int add=flex?(flexible?spare/flex:0):(control && controls?spare/controls:0);
++    if(!flex && row->height+add>40)add=40-row->height;
++    if(add<0)add=0;
++    row->height+=add;
++    if(flexible){spare-=add;flex--;}
++    else if(control && !flex){spare-=add;controls--;}
++   }
++   col->height=204-spare;
++  }
++  int row_y=21;
++  int col_x=14;
++  for(int k=0;k<i;k++)col_x+=menu->cols[dialog->colstart+k].width;
++  for(int j=0;j<col->numrows;j++){
++   struct menurow *row=&menu->rows[col->rowstart+j];
++   if(dialog->definition->items[row->itemindex].type==MENUITEMTYPE_MODEL){
++    pd_inventory_rect[0]=col_x+4;pd_inventory_rect[1]=row_y;
++    pd_inventory_rect[2]=col->width-8;pd_inventory_rect[3]=row->height;
++   }
++   row_y+=row->height;
++  }
++  /* Each bottom column has its own full-height content viewport. */
++  if(col->height<=204)dialog->scroll=0;
++
++ }
++ extern struct menudialogdef g_SoloMissionInventoryMenuDialog,g_FrWeaponsAvailableMenuDialog;
++ pd_inventory_layout=!standalone && (dialog->definition==&g_SoloMissionInventoryMenuDialog
++  || dialog->definition==&g_FrWeaponsAvailableMenuDialog);
++ if(pd_inventory_layout){
++  pd_inventory_rect[0]=134;pd_inventory_rect[1]=60;
++  pd_inventory_rect[2]=168;pd_inventory_rect[3]=112;
++  dialog->scroll=0;
++ }
++ g_MenuProjectFromX=g_MenuProjectFromY=0;
++ var80070f10=NULL; /* Allocate a bottom viewport, leaving the top's Vp immutable. */
++ gDPNoOpTag(gdl++,0x50444201);
++ gdl=func0f0d479c(gdl);
++ gSPDisplayList(gdl++,var800613a0);
++ gDPSetScissor(gdl++,G_SC_NON_INTERLACE,0,0,320,240);
++ textResetBlends();
++ gdl=text0f153ab0(gdl);
++ gdl=menuRenderDialog(gdl,dialog,menu,false);
++ if(objectives){
++  int indices[10];int count=pd_bottom_objective_indices(indices,10);
++  for(int i=0;i<count;i++)gdl=menuitemObjectivesRenderOne(gdl,dialog,
++   indices[i],i+1,20,32+i*(count>4?22:30),280,192,true,false);
++ }
++ text0f153b40();
++ gDPNoOpTag(gdl++,0x50444200);
++ *menu=saved;g_MpPlayerNum=saved_player;*g_ViBackData=vi;var80070f10=saved_viewport;
++ var800a4634=saved_planes;var800a4638=saved_plane_end;
++ g_ScaleX=saved_scale;g_MenuProjectFromX=saved_project_x;g_MenuProjectFromY=saved_project_y;
++ g_MenuScissorX1=clip[0];g_MenuScissorY1=clip[1];g_MenuScissorX2=clip[2];g_MenuScissorY2=clip[3];
++ g_ScissorX1=clip[4];g_ScissorY1=clip[5];g_ScissorX2=clip[6];g_ScissorY2=clip[7];
++ var8009de90=clip[8];var8009de94=clip[9];g_RngSeed=saved_rng;pd_bottom_ui_drawing=0;pd_inventory_layout=false;
++ textResetBlends();
++ return gdl;
++}
++Gfx *pd_render_bottom_idle_native(Gfx *gdl){return pdRenderBottomDialogPass(gdl,2);}
++Gfx *pd_render_bottom_objectives_native(Gfx *gdl)
++{
++ return pdRenderBottomDialogPass(gdl,true);
++}
++#endif
++
+ Gfx *menuRender(Gfx *gdl)
+ {
++#ifdef __3DS__
++ pd_inventory_geometry=NULL;memset(pd_inventory_rect,0,sizeof(pd_inventory_rect));
++#endif
+ 	static u32 usepiece = 1;
+ 
+ 	g_MpPlayerNum = 0;
+@@ -5427,6 +5792,16 @@ Gfx *menuRender(Gfx *gdl)
+ 
+ 	gSPDisplayList(gdl++, var800613a0);
+ 
++	// Mirror only background geometry; dialog layout is independent on the touch screen.
++#ifdef __3DS__
++	/* Bottom dialogs draw their own projection background. */
++#endif
++#ifdef __3DS__
++ /* Gameplay/HUD scissoring must not clip the opening menu background. */
++ gDPSetScissor(gdl++,G_SC_NON_INTERLACE,0,0,viGetWidth(),viGetHeight());
++ gSPClearExtraGeometryModeEXT(gdl++,G_ASPECT_MODE_EXT);
++ gDPNoOpTag(gdl++,0x50444601); /* Backdrop stays at the LCD plane. */
++#endif
+ 	// Render the background
+ 	if (g_MenuData.nextbg != 255) {
+ 		if (g_MenuData.nextbg == 0) {
+@@ -5439,6 +5814,11 @@ Gfx *menuRender(Gfx *gdl)
+ 		gdl = menuRenderBackgroundLayer1(gdl, g_MenuData.bg, 1.0f);
+ 	}
+ 
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50444600);
++ gSPClearExtraGeometryModeEXT(gdl++,G_ASPECT_MODE_EXT);
++#endif
++
+ #ifndef PLATFORM_N64
+ 	gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+ #endif
+@@ -5536,6 +5916,10 @@ Gfx *menuRender(Gfx *gdl)
+ 		gdl = menuRenderBackgroundLayer2(gdl, g_MenuData.bg, 1.0f);
+ 	}
+ 
++
++#ifdef __3DS__
++	gDPNoOpTag(gdl++, 0x50444d00);
++#endif
+ 	// Render the health bar (playerRenderHealthBar may choose not to render)
+ 	if ((g_MenuData.bg || g_MenuData.nextbg != 255)
+ 			&& (!g_Vars.currentplayer->eyespy || !g_Vars.currentplayer->eyespy->active)) {
+@@ -5554,6 +5938,7 @@ Gfx *menuRender(Gfx *gdl)
+ 		// Render dialogs
+ 		gdl = text0f153ab0(gdl);
+ 
++
+ 		if (g_MenuData.root == MENUROOT_MPPAUSE || g_MenuData.root == MENUROOT_MPENDSCREEN) {
+ 			g_MpPlayerNum = g_Vars.currentplayerstats->mpindex;
+ 			gdl = menuRenderDialogs(gdl);
+@@ -5762,6 +6147,9 @@ Gfx *menuRender(Gfx *gdl)
+ 	gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_MODE_EXT);
+ #endif
+ 
++#ifdef __3DS__
++ gdl=pdRenderBottomDialogPass(gdl,false);
++#endif
+ 	gdl = func0f0d49c8(gdl);
+ 
+ 	g_ScaleX = 1;
+diff --git a/src/game/menugfx.c b/src/game/menugfx.c
+index 11b9f9a..b77eb59 100644
+--- a/src/game/menugfx.c
++++ b/src/game/menugfx.c
+@@ -1,3 +1,9 @@
++#ifdef __3DS__
++#include "pd_menu_theme.h"
++#endif
++#ifdef __3DS__
++#include "pd_objectives.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "game/game_006900.h"
+@@ -125,6 +131,12 @@ void menugfxCreateBlur(void)
+ 
+ 	g_ScaleX = 1;
+ #else
++	// Backends without offscreen framebuffers (e.g. the native 3DS PICA path)
++	// use the menu gradient instead of the captured/blurred background.
++	if (!videoFramebuffersSupported()) {
++		return;
++	}
++
+ 	if (g_MenuBlurFb < 0) {
+ 		g_MenuBlurFb = videoCreateFramebuffer(BLURIMG_WIDTH, BLURIMG_HEIGHT, true, false);
+ 		g_MenuScreenFb = videoCreateFramebuffer(0, 0, false, true);
+@@ -145,9 +157,18 @@ Gfx *menugfxRenderBgBlur(Gfx *gdl, u32 colour, s16 arg2, s16 arg3)
+ 	s32 height;
+ #endif
+ 
+-	if (IS4MB())
+-	{
+-		return menugfxRenderGradient(gdl, 0, 0, viGetWidth(), viGetHeight(), 0xff, 0xff, 0xff);
++	if (IS4MB()
++#ifndef PLATFORM_N64
++			|| !videoFramebuffersSupported()
++#endif
++	) {
++		#ifdef __3DS__
++        /* Preserve the original fade when framebuffer blur is unavailable. */
++        u32 alpha=colour&255;
++        return menugfxRenderGradient(gdl,0,0,viGetWidth(),viGetHeight(),alpha,alpha,alpha);
++#else
++        return menugfxRenderGradient(gdl, 0, 0, viGetWidth(), viGetHeight(), 0xff, 0xff, 0xff);
++#endif
+ 	}
+ 
+ #ifndef PLATFORM_N64
+@@ -802,7 +823,11 @@ Gfx *menugfxRenderGradient(Gfx *gdl, s32 x1, s32 y1, s32 x2, s32 y2, u32 colours
+ 
+ 	gDPSetRenderMode(gdl++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
+ 
+-	ymid = (y1 + y2) / 2;
++	#ifdef __3DS__
++ ymid = pd_menu_gradient_midpoint(y1,y2);
++#else
++ ymid = (y1 + y2) / 2;
++#endif
+ 
+ 	if (x2 - x1 < ymid * 2) {
+ 		ymid <<= 0;
+@@ -969,6 +994,11 @@ Gfx *menugfx0f0e2498(Gfx *gdl)
+ 
+ Gfx *menugfxDrawTri2(Gfx *gdl, s32 x1, s32 y1, s32 x2, s32 y2, u32 colour1, u32 colour2, bool arg7)
+ {
++#ifdef __3DS__
++ if(pd_bottom_native_capturing)pd_bottom_line(gdl,x1,y1,x2,y2,colour1,colour2,arg7);
++ if(pd_rendering_objectives)return pd_bottom_line(gdl,x1,y1,x2,y2,colour1,colour2,arg7);
++#endif
++
+ 	Vtx *vertices;
+ 	Col *colours;
+ 
+@@ -1774,6 +1804,11 @@ Gfx *menugfxRenderBgFailureCopy(Gfx *gdl)
+ }
+ 
+ struct coord *g_MenuParticles = NULL;
++#ifdef __3DS__
++/* Native endscreen transitions can overlap the final weapon render. Keep
++ * the success backdrop from replacing a still-live gun model in gunmem. */
++static struct coord pd_success_particles[NUM_SUCCESS_PARTICLES];
++#endif
+ 
+ /**
+  * Menu particles are stored in gunmem. Gunmem doesn't need to be freed because
+@@ -1818,7 +1853,11 @@ Gfx *menugfxRenderBgSuccess(Gfx *gdl)
+ 
+ 	// Initialise particles if they haven't been already
+ 	if (g_MenuParticles == NULL) {
++#ifdef __3DS__
++		g_MenuParticles = pd_success_particles;
++#else
+ 		g_MenuParticles = (struct coord *) bgunGetGunMem();
++#endif
+ 
+ 		if (g_MenuParticles == NULL) {
+ 			return gdl;
+diff --git a/src/game/menuitem.c b/src/game/menuitem.c
+index be3f627..ff4f395 100644
+--- a/src/game/menuitem.c
++++ b/src/game/menuitem.c
+@@ -1,3 +1,9 @@
++#ifdef __3DS__
++#include "pd_text_wrap.h"
++#endif
++#ifdef __3DS__
++#include "pd_objectives.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "game/camdraw.h"
+@@ -24,7 +30,11 @@
+ #include "types.h"
+ #ifndef PLATFORM_N64
+ #include "input.h"
++#ifdef __3DS__
++#define MENU_KEYBOARD_ROWS 5
++#else
+ #define MENU_KEYBOARD_ROWS 6
++#endif
+ #else
+ #define MENU_KEYBOARD_ROWS 5
+ #endif
+@@ -247,6 +257,9 @@ Gfx *menuitemListRender(Gfx *gdl, struct menurendercontext *context)
+ 	}
+ 
+ 	width = context->dialog->width;
++#ifdef __3DS__
++ if(pd_bottom_ui_drawing)width=context->width;
++#endif
+ 
+ 	if (context->item->flags & MENUITEMFLAG_LIST_AUTOWIDTH) {
+ 		width = context->width;
+@@ -452,6 +465,9 @@ Gfx *menuitemListRender(Gfx *gdl, struct menurendercontext *context)
+ 				s4 += LINEHEIGHT;
+ 			} else {
+ 				if (optionindex < numoptions) {
++#ifdef __3DS__
++                    pd_bottom_native_hit(context,optionindex,context->y+s4,g_LineHeight);
++#endif
+ 					// Draw an option
+ 					union handlerdata spb8;
+ 					bool spb4 = false;
+@@ -1111,8 +1127,59 @@ bool menuitemKeyboardIsStringEmptyOrSpaces(char *text)
+  * |  DEL  |    CAPS   |   CANCEL  |   OK  |
+  * +-------+-----------+-----------+-------+
+  */
++#ifdef __3DS__
++/* Native bottom-LCD keys use the existing keyboard state and handlers. */
++static Gfx *pdKeyboardRender(Gfx *gdl, struct menurendercontext *context)
++{
++ struct menuitemdata_keyboard *kb=&context->data->keyboard;
++ int left=20,top=context->y+30,cell=28,rowheight=30;
++ u32 colour=g_MenuColours[context->dialog->type].item_unfocused;
++ u32 border=g_MenuColours[context->dialog->type].dialog_border1;
++ u32 focus=g_MenuColours[context->dialog->type].item_focused_inner;
++ gdl=textSetPrimColour(gdl,g_MenuColours[context->dialog->type].dialog_titlebg);
++ gDPFillRectangleScaled(gdl++,left,context->y+2,left+280,context->y+24);
++ gdl=text0f153838(gdl);gdl=text0f153628(gdl);
++ int x=left+6,y=context->y+8;
++ gdl=textRenderProjected(gdl,&x,&y,kb->string,g_CharsHandelGothicSm,g_FontHandelGothicSm,0xffffffff,280,20,0,0);
++ gdl=text0f153780(gdl);
++ for(int row=0;row<5;row++)for(int col=0;col<10;col++){
++  int span=1;char letter[3]={0,'\n',0};char *label=letter;
++  if(row==4){
++   int id;
++   if(col==0){span=2;id=L_OPTIONS_314;}
++   else if(col==2){span=3;id=L_OPTIONS_315;}
++   else if(col==5){span=3;id=L_OPTIONS_316;}
++   else if(col==8){span=2;id=L_OPTIONS_317;}
++   else continue;
++   label=langGet(id);
++  }else{
++   letter[0]=g_KeyboardKeys[row][col];
++   if(!kb->capseffective && letter[0]>='A' && letter[0]<='Z')letter[0]+=32;
++  }
++  int x1=left+col*cell,y1=top+row*rowheight,w=span*cell;
++  u32 edge=kb->row==row && kb->col==col?focus:border;
++  gdl=menugfxDrawFilledRect(gdl,x1,y1,x1+w-1,y1+1,edge,edge);
++  gdl=menugfxDrawFilledRect(gdl,x1,y1+rowheight-2,x1+w-1,y1+rowheight-1,edge,edge);
++  gdl=menugfxDrawFilledRect(gdl,x1,y1,x1+1,y1+rowheight-1,edge,edge);
++  gdl=menugfxDrawFilledRect(gdl,x1+w-2,y1,x1+w-1,y1+rowheight-1,edge,edge);
++  int th,tw;textMeasure(&th,&tw,label,g_CharsHandelGothicSm,g_FontHandelGothicSm,0);
++  x=x1+(w-tw)/2;y=y1+(rowheight-th)/2;
++  u32 ink=(row==4 && col==2 && kb->capseffective)?0xffff00ff:colour;
++  if(row==4 && col==8 && menuitemKeyboardIsStringEmptyOrSpaces(kb->string))ink=g_MenuColours[context->dialog->type].item_disabled;
++  gdl=text0f153628(gdl);
++  gdl=textRenderProjected(gdl,&x,&y,label,g_CharsHandelGothicSm,g_FontHandelGothicSm,ink,w,rowheight,0,0);
++  gdl=text0f153780(gdl);
++  pd_bottom_keyboard_hit(context,row,col,x1,y1,w,rowheight);
++ }
++ return gdl;
++}
++#endif
++
+ Gfx *menuitemKeyboardRender(Gfx *gdl, struct menurendercontext *context)
+ {
++#ifdef __3DS__
++ if(pd_bottom_ui_drawing)return pdKeyboardRender(gdl,context);
++#endif
+ 	char label[8];
+ 	s32 x;
+ 	s32 y;
+@@ -1789,6 +1856,10 @@ Gfx *menuitemObjectivesRenderOne(Gfx *gdl, struct menudialog *dialog, s32 index,
+ 
+ 	mainOverrideVariable("brcol", &var800711e8);
+ 	sp120 = langGet(g_Briefing.objectivenames[index]);
++#ifdef __3DS__
++ /* The results/decline path can unload the mission bank this frame. */
++ if(!sp120)return gdl;
++#endif
+ 	y = objy;
+ 	sp12c = MIXCOLOUR(dialog, item_unfocused);
+ 
+@@ -1817,7 +1888,11 @@ Gfx *menuitemObjectivesRenderOne(Gfx *gdl, struct menudialog *dialog, s32 index,
+ 	}
+ 
+ 	if (withstatus) {
++#ifdef __3DS__
++		switch ((pd_rendering_objectives || (pd_bottom_ui_drawing && !g_Menus[0].curdialog)) ? g_ObjectiveStatuses[index] : objectiveCheck(index)) {
++#else
+ 		switch (objectiveCheck(index)) {
++#endif
+ 		case OBJECTIVE_INCOMPLETE:
+ 			spcc = langGet(L_OPTIONS_001); // "Incomplete"
+ 			spc8 = 0xffff00ff;
+@@ -1832,7 +1907,11 @@ Gfx *menuitemObjectivesRenderOne(Gfx *gdl, struct menudialog *dialog, s32 index,
+ 			break;
+ 		}
+ 
+-		if (dialog != g_Menus[g_MpPlayerNum].curdialog) {
++		if (dialog != g_Menus[g_MpPlayerNum].curdialog
++#ifdef __3DS__
++				&& !pd_rendering_objectives && !(pd_bottom_ui_drawing && !g_Menus[0].curdialog)
++#endif
++		) {
+ 			spc8 = g_MenuColours[0].item_unfocused;
+ 		}
+ 
+@@ -2034,7 +2113,11 @@ Gfx *menuitemLabelRender(Gfx *gdl, struct menurendercontext *context)
+ 	}
+ 
+ #if VERSION != VERSION_JPN_FINAL
+-	if (context->item->flags & MENUITEMFLAG_SMALLFONT) {
++	if ((context->item->flags & MENUITEMFLAG_SMALLFONT)
++#ifdef __3DS__
++     && !pd_bottom_ui_drawing
++#endif
++    ) {
+ 		font1 = g_CharsHandelGothicXs;
+ 		font2 = g_FontHandelGothicXs;
+ 		y -= 2;
+@@ -2150,7 +2233,11 @@ Gfx *menuitemLabelRender(Gfx *gdl, struct menurendercontext *context)
+ 			y = context->y + 2;
+ 
+ #if VERSION != VERSION_JPN_FINAL
+-			if (context->item->flags & MENUITEMFLAG_SMALLFONT) {
++			if ((context->item->flags & MENUITEMFLAG_SMALLFONT)
++#ifdef __3DS__
++     && !pd_bottom_ui_drawing
++#endif
++    ) {
+ 				y -= 2;
+ 			}
+ #endif
+@@ -3062,9 +3149,25 @@ Gfx *menuitemScrollableRender(Gfx *gdl, struct menurendercontext *context)
+ 	}
+ 
+ 	if (rawtext) {
+-		textWrap(context->width - paddingright, rawtext, alltext, g_CharsHandelGothicSm, g_FontHandelGothicSm);
++		#ifdef __3DS__
++ pd_text_wrap(context->width-paddingright,rawtext,alltext,sizeof alltext,g_CharsHandelGothicSm,g_FontHandelGothicSm,textMeasure);
++#else
++ textWrap(context->width - paddingright, rawtext, alltext, g_CharsHandelGothicSm, g_FontHandelGothicSm);
++#endif
+ 	}
+ 
++#ifdef __3DS__
++ if(pd_bottom_ui_drawing){
++  s32 height,width;
++  textMeasure(&height,&width,alltext,g_CharsHandelGothicSm,g_FontHandelGothicSm,0);
++  int maximum=height-context->height+5;
++  if(maximum<0)maximum=0;
++  int oldmax=data->maxscrolloffset;
++  data->scrolloffset=oldmax>0?data->scrolloffset*maximum/oldmax:0;
++  if(data->scrolloffset<0)data->scrolloffset=0;
++  if(data->scrolloffset>maximum)data->scrolloffset=maximum;
++ }
++#endif
+ 	inptr = alltext;
+ 	streams[1] = headingtext;
+ 	streams[0] = bodytext;
+@@ -3123,7 +3226,11 @@ Gfx *menuitemScrollableRender(Gfx *gdl, struct menurendercontext *context)
+ 			g_MenuWave2Colours[context->dialog->type].item_unfocused,
+ 			g_MenuWave1Colours[context->dialog->type].item_unfocused);
+ 
+-	gdl = text0f153628(gdl);
++#ifdef __3DS__
++ int saved_objective_render=pd_rendering_objectives;
++ if(pd_bottom_ui_drawing){pd_bottom_text_overlay=1;pd_rendering_objectives=1;}
++#endif
++ gdl = text0f153628(gdl);
+ 
+ 	// Heading text shadow
+ 	x = context->x + 3;
+@@ -3144,7 +3251,10 @@ Gfx *menuitemScrollableRender(Gfx *gdl, struct menurendercontext *context)
+ 	gdl = textRenderProjected(gdl, &x, &y, bodytext, g_CharsHandelGothicSm, g_FontHandelGothicSm,
+ 			colour, context->width - 4, context->height - 1, -data->scrolloffset, 0);
+ 
+-	return text0f153780(gdl);
++#ifdef __3DS__
++ pd_rendering_objectives=saved_objective_render;
++#endif
++ return text0f153780(gdl);
+ }
+ 
+ bool menuitemScrollableTick(struct menuitem *item, struct menudialog *dialog, struct menuinputs *inputs, u32 tickflags, union menuitemdata *data)
+@@ -3183,7 +3293,11 @@ bool menuitemScrollableTick(struct menuitem *item, struct menudialog *dialog, st
+ 		rawtext = menuitemScrollableGetText(item->param);
+ 
+ 		if (rawtext) {
+-			textWrap(width, rawtext, wrapped, g_CharsHandelGothicSm, g_FontHandelGothicSm);
++			#ifdef __3DS__
++ pd_text_wrap(width,rawtext,wrapped,sizeof wrapped,g_CharsHandelGothicSm,g_FontHandelGothicSm,textMeasure);
++#else
++ textWrap(width, rawtext, wrapped, g_CharsHandelGothicSm, g_FontHandelGothicSm);
++#endif
+ 		}
+ 
+ 		textMeasure(&height, &width, wrapped, g_CharsHandelGothicSm, g_FontHandelGothicSm, 0);
+@@ -3282,7 +3396,11 @@ Gfx *menuitemMarqueeRender(Gfx *gdl, struct menurendercontext *context)
+ 	zero = 0;
+ 
+ #if VERSION != VERSION_JPN_FINAL
+-	if (context->item->flags & MENUITEMFLAG_SMALLFONT) {
++	if ((context->item->flags & MENUITEMFLAG_SMALLFONT)
++#ifdef __3DS__
++     && !pd_bottom_ui_drawing
++#endif
++    ) {
+ 		font2 = g_FontHandelGothicXs;
+ 		font1 = g_CharsHandelGothicXs;
+ 	}
+diff --git a/src/game/mplayer/mplayer.c b/src/game/mplayer/mplayer.c
+index ebadf45..fc066d0 100644
+--- a/src/game/mplayer/mplayer.c
++++ b/src/game/mplayer/mplayer.c
+@@ -135,7 +135,7 @@ struct mpweapon g_MpWeapons[NUM_MPWEAPONS] = {
+ 	.mouseaimspeedy = 0.7f, \
+ 	.radialmenuspeed = 4.f, \
+ 	.crosshairsway = 1.f, \
+-	.crouchmode = CROUCHMODE_TOGGLE_ANALOG, \
++	.crouchmode = CROUCHMODE_TOGGLE, \
+ 	.extcontrols = true, \
+ 	.crosshaircolour = 0x00ff0028, \
+ 	.crosshairsize = 2, \
+diff --git a/src/game/mplayer/setup.c b/src/game/mplayer/setup.c
+index 6821cb5..101bc3b 100644
+--- a/src/game/mplayer/setup.c
++++ b/src/game/mplayer/setup.c
+@@ -271,7 +271,7 @@ MenuItemHandlerResult menuhandlerMpControlStyle(s32 operation, struct menuitem *
+ 		data->dropdown.value = 5;
+ 		break;
+ 	case MENUOP_GETOPTIONTEXT:
+-		return (intptr_t) ((data->dropdown.value == 4) ? "Ext" : langGet(labels[data->dropdown.value]));
++		return (intptr_t) ((data->dropdown.value == 4) ? "3DS Dual Stick" : langGet(labels[data->dropdown.value]));
+ 	case MENUOP_SET:
+ 		optionsSetControlMode(g_MpPlayerNum, (data->dropdown.value == 4 ? CONTROLMODE_PC : data->dropdown.value));
+ #ifndef PLATFORM_N64
+diff --git a/src/game/player.c b/src/game/player.c
+index 16a6d25..f48c303 100644
+--- a/src/game/player.c
++++ b/src/game/player.c
+@@ -2341,6 +2341,13 @@ Gfx *player0f0baf84(Gfx *gdl)
+ Gfx *playerDrawFade(Gfx *gdl, u32 r, u32 g, u32 b, f32 frac)
+ {
+ 	if (frac > 0) {
++#ifdef __3DS__
++        /* Screen overlays follow the gameplay viewport, not HUD 4:3 anchors. */
++        gSPClearExtraGeometryModeEXT(gdl++,G_ASPECT_MODE_EXT);
++        gDPNoOpTag(gdl++,0x50444601);
++        gDPSetScissor(gdl++,G_SC_NON_INTERLACE,viGetViewLeft(),viGetViewTop(),
++            viGetViewLeft()+viGetViewWidth(),viGetViewTop()+viGetViewHeight());
++#endif
+ 		gDPPipeSync(gdl++);
+ 		gDPSetCycleType(gdl++, G_CYC_1CYCLE);
+ 		gDPSetColorDither(gdl++, G_CD_DISABLE);
+@@ -2359,6 +2366,9 @@ Gfx *playerDrawFade(Gfx *gdl, u32 r, u32 g, u32 b, f32 frac)
+ 		gDPSetColorDither(gdl++, G_CD_BAYER);
+ 		gDPSetTexturePersp(gdl++, G_TP_PERSP);
+ 		gDPSetTextureLOD(gdl++, G_TL_LOD);
++#ifdef __3DS__
++        gDPNoOpTag(gdl++,0x50444600);
++#endif
+ 	}
+ 
+ 	return gdl;
+@@ -2972,8 +2982,25 @@ s16 playerGetViewportLeft(void)
+ 	return left;
+ }
+ 
++#ifdef __3DS__
++#include "pd_runtime.h"
++#include "pd_cutscene_bars.h"
++static bool pdCutsceneFrame(struct pd_cutscene_frame *frame){
++ int mode=pd_option_get(18);
++ if(!mode || !g_InCutscene || g_MainIsEndscreen || var8009dfc0
++   || (PLAYERCOUNT()>=2 && !playerHasSharedViewport()))return false;
++ float tween=g_CutsceneTweenDuration60>=1?g_CutsceneTweenFrac:0;
++ *frame=pd_cutscene_frame(mode,g_ViModes[g_ViRes].fulltop,g_ViModes[g_ViRes].fullheight,
++  g_ViModes[g_ViRes].fulltop,g_ViModes[g_ViRes].fullheight,g_ViModes[g_ViRes].cinemaheight,tween);
++ return true;
++}
++#endif
++
+ s16 playerGetViewportHeight(void)
+ {
++#ifdef __3DS__
++ struct pd_cutscene_frame frame;if(pdCutsceneFrame(&frame))return frame.height;
++#endif
+ 	s16 height;
+ 
+ 	if (PLAYERCOUNT() >= 2
+@@ -3025,6 +3052,9 @@ s16 playerGetViewportHeight(void)
+ 
+ s16 playerGetViewportTop(void)
+ {
++#ifdef __3DS__
++ struct pd_cutscene_frame frame;if(pdCutsceneFrame(&frame))return frame.top;
++#endif
+ 	s16 top;
+ 
+ 	if (PLAYERCOUNT() >= 2
+@@ -4618,7 +4648,13 @@ Gfx *playerRenderHud(Gfx *gdl)
+ 	if (g_Vars.currentplayer->cameramode != CAMERAMODE_EYESPY) {
+ 		bgunTickGameplay2();
+ 		gdl = boltbeamsRender(gdl);
++#ifdef __3DS__
++		gDPNoOpTag(gdl++, 0x50445601);
++#endif
+ 		bgunRender(&gdl);
++#ifdef __3DS__
++		gDPNoOpTag(gdl++, 0x50445600);
++#endif
+ 		gdl = lasersightRenderDot(gdl);
+ 
+ 		if (g_Vars.currentplayer->visionmode != VISIONMODE_XRAY) {
+diff --git a/src/game/propobj.c b/src/game/propobj.c
+index 0d1b3f2..184f94e 100644
+--- a/src/game/propobj.c
++++ b/src/game/propobj.c
+@@ -13856,9 +13856,15 @@ Gfx *objRender(struct prop *prop, Gfx *gdl, bool xlupass)
+ 	}
+ 
+ 	renderdata.fogcolour = colour[0] << 24 | colour[1] << 16 | colour[2] << 8 | colour[3];
++#ifdef __3DS__
++ bool pd_glass=obj->type==OBJTYPE_GLASS || obj->type==OBJTYPE_TINTEDGLASS;
++ if(pd_glass)gDPNoOpTag(renderdata.gdl++,0x50444701);
++#endif
+ 	objRenderProp(prop, &renderdata, xlupass);
+-
+ 	gdl = renderdata.gdl;
++#ifdef __3DS__
++ if(pd_glass)gDPNoOpTag(gdl++,0x50444700);
++#endif
+ 
+ 	if (xlupass) {
+ 		if (obj->type == OBJTYPE_HOVERPROP
+diff --git a/src/game/savebuffer.c b/src/game/savebuffer.c
+index 6a9bcf5..3cb0e7a 100644
+--- a/src/game/savebuffer.c
++++ b/src/game/savebuffer.c
+@@ -184,6 +184,16 @@ Gfx *func0f0d4c80(Gfx *gdl)
+ 
+ Gfx *menugfxDrawPlane(Gfx *gdl, s32 x1, s32 y1, s32 x2, s32 y2, u32 colour1, u32 colour2, s32 type)
+ {
++#ifdef __3DS__
++ extern Gfx *var800a4638;
++ /* Each plane emits three commands. Keep room for the closing tag/end and
++  * chain a fresh frame-owned block instead of overrunning a busy menu list. */
++ if(gdl==var800a4634 && gdl+5>var800a4638){
++  Gfx *next=gfxAllocate(sizeof(Gfx)*532);
++  gSPBranchList(gdl++,osVirtualToPhysical(next));
++  gdl=next;var800a4638=next+532;
++ }
++#endif
+ 	Col *colours;
+ 	Vtx *vertices;
+ 	f32 tmp1;
+diff --git a/src/game/shards.c b/src/game/shards.c
+index 4fe3c4c..6ada0dc 100644
+--- a/src/game/shards.c
++++ b/src/game/shards.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "pd_runtime.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "data.h"
+@@ -228,6 +231,9 @@ Gfx *shardsRenderWood(Gfx *gdl)
+ 
+ 		for (i = 0; i < g_MaxShards; i++) {
+ 			if (g_Shards[i].age60 > 0 && g_Shards[i].type == SHARDTYPE_WOOD) {
++#ifdef __3DS__
++ if(!pd_effect_visible(&g_Shards[i].pos,i))continue;
++#endif
+ 				bool render = true;
+ 				f32 alphamult = 1.0f;
+ 				f32 xraydist;
+diff --git a/src/game/sight.c b/src/game/sight.c
+index 9167af4..65af3f9 100644
+--- a/src/game/sight.c
++++ b/src/game/sight.c
+@@ -22,8 +22,15 @@
+ #ifndef PLATFORM_N64
+ #include <math.h>
+ #include "video.h"
++#ifdef __3DS__
++#include "pd_crosshair.h"
++#endif
+ 
++#ifdef __3DS__
++#define SIGHT_COLOUR pd_crosshair_colour(((PLAYER_EXTCFG().crosshairhealth >= CROSSHAIR_HEALTH_ON_GREEN) ? sightGetCrosshairHealthColor(g_Vars.currentplayer->bondhealth, g_Vars.currentplayer->prop->chr->cshield * 0.125f) : PLAYER_EXTCFG().crosshaircolour))
++#else
+ #define SIGHT_COLOUR ((PLAYER_EXTCFG().crosshairhealth >= CROSSHAIR_HEALTH_ON_GREEN) ? sightGetCrosshairHealthColor(g_Vars.currentplayer->bondhealth, g_Vars.currentplayer->prop->chr->cshield * 0.125f) : PLAYER_EXTCFG().crosshaircolour)
++#endif
+ #define SIGHT_SCALE PLAYER_EXTCFG().crosshairsize
+ 
+ static u32 sightGetCrosshairHealthColor(float health, float shield)
+@@ -501,8 +508,43 @@ Gfx *sightDrawTargetBox(Gfx *gdl, struct trackedprop *trackedprop, s32 textid, s
+ 	return gdl;
+ }
+ 
++#ifdef __3DS__
++static Gfx *pdDrawCrosshair(Gfx *gdl,s32 x,s32 y,u32 colour){
++ int style=pd_option_get(41);x=sightGetAdjustedX(x);
++ /* Retail's faint alpha was intended for its much larger sight lines.
++  * Give compact custom shapes a readable default; explicit opacity wins. */
++ if(!pd_option_get(42) && (colour&255)<160)colour=(colour&0xffffff00)|160;
++ gdl=text0f153628(gdl);
++ gSPClearGeometryMode(gdl++,G_ZBUFFER | G_CULL_BOTH | G_LIGHTING | G_FOG);
++ int left=viGetViewLeft()/g_ScaleX,top=viGetViewTop();
++ int right=left+viGetViewWidth()/g_ScaleX,bottom=top+viGetViewHeight();
++ gSPSetExtraGeometryModeEXT(gdl++,G_ASPECT_CENTER_EXT);
++ gDPSetSubpixelOffsetEXT(gdl++,-2,-2);
++ gDPSetScissor(gdl++,G_SC_NON_INTERLACE,left*g_ScaleX,top,right*g_ScaleX,bottom);
++ for(int pass=0;pass<2;pass++){
++  unsigned ink=pd_crosshair_colour(colour);if(!pass)ink=(ink&255)*180/230;
++  gdl=textSetPrimColour(gdl,ink);
++  for(int dy=-7;dy<=7;dy++)for(int dx=-7;dx<=7;){
++   if(!pd_crosshair_pixel(style,dx,dy)){dx++;continue;}
++   int first=dx;while(dx<=7 && pd_crosshair_pixel(style,dx,dy))dx++;
++   int border=pass?0:1,x1=x+first-border,x2=x+dx-1+border,y1=y+dy-border,y2=y+dy+border;
++   if(x1<left)x1=left;if(x2>=right)x2=right-1;if(y1<top)y1=top;if(y2>=bottom)y2=bottom-1;
++   if(x1<=x2 && y1<=y2)gDPHudRectangle(gdl++,x1,y1,x2,y2);
++  }
++ }
++ /* Leave the depth sampler centred on the actual aim point. */
++ gdl=textSetPrimColour(gdl,0);gDPHudRectangle(gdl++,x-1,y-1,x+1,y+1);
++ gSPClearExtraGeometryModeEXT(gdl++,G_ASPECT_CENTER_EXT);gDPSetSubpixelOffsetEXT(gdl++,0,0);
++ return text0f153838(gdl);
++}
++#endif
++
+ Gfx *sightDrawAimer(Gfx *gdl, s32 x, s32 y, s32 radius, s32 cornergap, u32 colour)
+ {
++#ifdef __3DS__
++ if(pd_option_get(41))return pdDrawCrosshair(gdl,x,y,colour);
++ colour=pd_crosshair_colour(colour);
++#endif
+ 	s32 viewleft = viGetViewLeft() / g_ScaleX;
+ 	s32 viewtop = viGetViewTop();
+ 	s32 viewwidth = viGetViewWidth() / g_ScaleX;
+@@ -906,6 +948,9 @@ Gfx *sightDrawDefault(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
+ 
+ Gfx *sightDrawClassic(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
+ {
++#ifdef __3DS__
++ if(pd_option_get(41) && sighton)return pdDrawCrosshair(gdl,(s32)crossx/g_ScaleX,(s32)crossy,SIGHT_COLOUR);
++#endif
+ 	struct textureconfig *tconfig = &g_TexGeCrosshairConfigs[0];
+ 	f32 spc4[2];
+ 	f32 spbc[2];
+@@ -1543,6 +1588,10 @@ Gfx *sightDrawMaian(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
+ 
+ Gfx *sightDrawTarget(Gfx *gdl, f32 crossx, f32 crossy)
+ {
++#ifdef __3DS__
++ /* Custom silhouettes replace the centre target sight too. */
++ if(pd_option_get(41))return gdl;
++#endif
+ 	s32 x = sightGetAdjustedX((s32)crossx / g_ScaleX);
+ 	s32 y = crossy;
+ 
+@@ -1643,30 +1692,72 @@ Gfx *sightDraw(Gfx *gdl, bool sighton, s32 sight)
+ 
+ 	sightTick(sighton);
+ 
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50444301);
++#endif
++
++#ifdef __3DS__
++ if(pd_option_get(41) && sight!=SIGHT_NONE){
++  if((sighton || pd_option_get(43)) && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex))
++   gdl=pdDrawCrosshair(gdl,(s32)crossx/g_ScaleX,(s32)crossy,SIGHT_COLOUR);
++ }else
++#endif
+ 	switch (sight) {
+ 	case SIGHT_DEFAULT:
+-		gdl = sightDrawDefault(gdl, sighton && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
++		gdl = sightDrawDefault(gdl, (sighton
++#ifdef __3DS__
++ || pd_option_get(43)
++#endif
++ ) && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
+ 		break;
+ 	case SIGHT_CLASSIC:
+-		gdl = sightDrawClassic(gdl, sighton && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
++		gdl = sightDrawClassic(gdl, (sighton
++#ifdef __3DS__
++ || pd_option_get(43)
++#endif
++ ) && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
+ 		break;
+ 	case SIGHT_2:
+-		gdl = sightDrawType2(gdl, sighton && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
++		gdl = sightDrawType2(gdl, (sighton
++#ifdef __3DS__
++ || pd_option_get(43)
++#endif
++ ) && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
+ 		break;
+ 	case SIGHT_3:
+-		gdl = sightDrawDefault(gdl, sighton && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
++		gdl = sightDrawDefault(gdl, (sighton
++#ifdef __3DS__
++ || pd_option_get(43)
++#endif
++ ) && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
+ 		break;
+ 	case SIGHT_SKEDAR:
+-		gdl = sightDrawSkedar(gdl, sighton && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
++		gdl = sightDrawSkedar(gdl, (sighton
++#ifdef __3DS__
++ || pd_option_get(43)
++#endif
++ ) && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
+ 		break;
+ 	case SIGHT_ZOOM:
+-		gdl = sightDrawZoom(gdl, sighton && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
++		gdl = sightDrawZoom(gdl, (sighton
++#ifdef __3DS__
++ || pd_option_get(43)
++#endif
++ ) && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
+ 		break;
+ 	case SIGHT_MAIAN:
+-		gdl = sightDrawMaian(gdl, sighton && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
++		gdl = sightDrawMaian(gdl, (sighton
++#ifdef __3DS__
++ || pd_option_get(43)
++#endif
++ ) && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
+ 		break;
+ 	default:
+-		gdl = sightDrawDefault(gdl, sighton && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
++		gdl = sightDrawDefault(gdl, (sighton
++#ifdef __3DS__
++ || pd_option_get(43)
++#endif
++ ) && optionsGetSightOnScreen(g_Vars.currentplayerstats->mpindex), crossx, crossy);
+ 		break;
+ 	case SIGHT_NONE:
+ 		break;
+@@ -1681,5 +1772,8 @@ Gfx *sightDraw(Gfx *gdl, bool sighton, s32 sight)
+ 
+ 	g_ScaleX = 1;
+ 
++#ifdef __3DS__
++ gDPNoOpTag(gdl++,0x50444300);
++#endif
+ 	return gdl;
+ }
+diff --git a/src/game/sky.c b/src/game/sky.c
+index 0b6903e..24078b6 100644
+--- a/src/game/sky.c
++++ b/src/game/sky.c
+@@ -3143,6 +3143,13 @@ Gfx *skyRenderOverexposure(Gfx *gdl)
+ 			+ g_Vars.currentplayer->overexposuregreen
+ 			+ g_Vars.currentplayer->overexposureblue) * (1.0f / 3.0f);
+ 
++#ifdef __3DS__
++        /* Light bloom covers the viewport, independently of HUD anchoring. */
++        gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_MODE_EXT);
++        gDPNoOpTag(gdl++, 0x50444601);
++        gDPSetScissor(gdl++, G_SC_NON_INTERLACE, viGetViewLeft(), viGetViewTop(),
++            viGetViewLeft()+viGetViewWidth(), viGetViewTop()+viGetViewHeight());
++#endif
+ 		gDPSetTexturePersp(gdl++, G_TP_NONE);
+ 		gDPSetColorDither(gdl++, G_CD_DISABLE);
+ 		gDPSetRenderMode(gdl++, G_RM_CLD_SURF, G_RM_CLD_SURF2);
+@@ -3167,6 +3174,9 @@ Gfx *skyRenderOverexposure(Gfx *gdl)
+ 				viGetViewTop() + viGetViewHeight());
+ 
+ 		gDPPipeSync(gdl++);
++#ifdef __3DS__
++        gDPNoOpTag(gdl++, 0x50444600);
++#endif
+ 	}
+ 
+ 	gDPSetColorDither(gdl++, G_CD_BAYER);
+diff --git a/src/game/smoke.c b/src/game/smoke.c
+index e065c7d..ef3d515 100644
+--- a/src/game/smoke.c
++++ b/src/game/smoke.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "pd_runtime.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "game/dlights.h"
+@@ -680,6 +683,9 @@ Gfx *smokeRender(struct prop *prop, Gfx *gdl, bool xlupass)
+ 
+ 		for (i = 0; i < ARRAYCOUNT(smoke->parts); i++) {
+ 			if (smoke->parts[i].size > 0) {
++#ifdef __3DS__
++ if(!pd_effect_visible(&smoke->parts[i].pos,i))continue;
++#endif
+ 				gdl = smokeRenderPart(smoke, &smoke->parts[i], gdl, &sp8c, sp88);
+ 			} else {
+ 				smoke->parts[i].size = 0;
+diff --git a/src/game/sparks.c b/src/game/sparks.c
+index 7f6f8f3..5f583ea 100644
+--- a/src/game/sparks.c
++++ b/src/game/sparks.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "pd_runtime.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "game/dlights.h"
+@@ -346,6 +349,9 @@ Gfx *sparksRender(Gfx *gdl)
+ 			group = &g_SparkGroups[i];
+ 
+ 			if (group->age != 0) {
++#ifdef __3DS__
++ if(!pd_effect_visible(&group->pos,i))continue;
++#endif
+ 				render = true;
+ 				sp138 = 1.0f;
+ 
+diff --git a/src/game/timing.c b/src/game/timing.c
+index 747c7ed..0780d23 100644
+--- a/src/game/timing.c
++++ b/src/game/timing.c
+@@ -12,6 +12,9 @@ void frametimeInit(void)
+ {
+ 	g_Vars.thisframestartt = osGetCount();
+ 	g_Vars.prevframestartt = g_Vars.thisframestartt;
++#ifdef __3DS__
++    g_Vars.lostframetime60t = g_Vars.lostframetime240t = 0;
++#endif
+ }
+ 
+ void frametimeApply(s32 diffframe60, s32 diffframe240, s32 frametime)
+@@ -40,6 +43,15 @@ void frametimeCalculate(void)
+ 	do {
+ 		count = osGetCount();
+ 		diffframet = count - g_Vars.thisframestartt;
++#ifdef __3DS__
++        // Keep normal 30/60 FPS timing, but discard a long stall's backlog.
++        // Audio also uses diffframe60, so this bounds its catch-up work too.
++        if (diffframet > CYCLES_PER_FRAME * 6u) {
++            sysLogPrintf(LOG_NOTE, "Timing hitch: %u cycles; dropping backlog beyond 100ms", diffframet);
++            diffframet = CYCLES_PER_FRAME * 6u;
++            g_Vars.lostframetime60t = g_Vars.lostframetime240t = 0;
++        }
++#endif
+ 		g_Vars.diffframet = diffframet;
+ 
+ 		diffframe60 = (g_Vars.lostframetime60t + diffframet + CYCLES_PER_FRAME / 2) / CYCLES_PER_FRAME;
+diff --git a/src/game/title.c b/src/game/title.c
+index c37103a..27ced51 100644
+--- a/src/game/title.c
++++ b/src/game/title.c
+@@ -1987,9 +1987,14 @@ void titleInitRareLogo(void)
+ 		musicQueueStopAllEvent();
+ 		joy00014810(false);
+ 
++#ifdef PLATFORM_N64
+ 		if (!g_IsTitleDemo && IS8MB()) {
+ 			g_IsTitleDemo = true;
+ 		}
++#else
++		// Ports continue from the title sequence to the front-end menu
++		// instead of the attract-mode Defection demo.
++#endif
+ 	}
+ }
+ 
+@@ -2769,6 +2774,10 @@ void titleTickOld(void)
+ 
+ Gfx *titleRender(Gfx *gdl)
+ {
++#ifdef __3DS__
++ bool flat=g_TitleMode!=TITLEMODE_PDLOGO && g_TitleMode!=TITLEMODE_RARELOGO;
++ if(flat)gDPNoOpTag(gdl++,0x50444601);
++#endif
+ 	if (g_TitleDelayedTimer == 0) {
+ 		switch (g_TitleMode) {
+ 		case TITLEMODE_LEGAL:
+@@ -2801,5 +2810,8 @@ Gfx *titleRender(Gfx *gdl)
+ 		}
+ 	}
+ 
++#ifdef __3DS__
++ if(flat)gDPNoOpTag(gdl++,0x50444600);
++#endif
+ 	return gdl;
+ }
+diff --git a/src/lib/audiomgr.c b/src/lib/audiomgr.c
+index 7791798..63f0116 100644
+--- a/src/lib/audiomgr.c
++++ b/src/lib/audiomgr.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "native_dsp_mix.h"
++#endif
+ #include <ultra64.h>
+ #include "lib/boot.h"
+ #include "lib/sched.h"
+@@ -340,7 +343,14 @@ void amgrFrame(void)
+ 		osAiSetNextBuffer(previnfo->data, previnfo->frameSamples * 4);
+ 	}
+ 
+-	if (somevalue > 1100 && var8005cf94 == 0) {
++	/* Keep about 100 ms queued on hardware; a 50 ms queue cannot cover
++	 * even two slow frames during combat. Keep the desktop policy unchanged. */
++#ifdef __3DS__
++	const s32 queue_target = 2208;
++#else
++	const s32 queue_target = 1100;
++#endif
++	if (somevalue > queue_target && var8005cf94 == 0) {
+ 		// already a lot queued, render 1 naudio frame (184 samples) this frame
+ 		info->frameSamples = 184;
+ 		var8005cf94 = 2;
+@@ -353,7 +363,13 @@ void amgrFrame(void)
+ 		}
+ 	}
+ 
++#ifdef __3DS__
++ native_dsp_mix_begin(info->data,info->frameSamples);
++#endif
+ 	Acmd *cmd = n_alAudioFrame(datastart, &var800918e8, outbuffer, info->frameSamples);
++#ifdef __3DS__
++ native_dsp_mix_end();
++#endif
+ 
+ 	var8005cf90 ^= 1;
+ 
+diff --git a/src/lib/naudio/n_synthesizer.c b/src/lib/naudio/n_synthesizer.c
+index 546a1a2..918fe2c 100644
+--- a/src/lib/naudio/n_synthesizer.c
++++ b/src/lib/naudio/n_synthesizer.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "native_dsp_mix.h"
++#endif
+ #include "n_synthInternals.h"
+ 
+ void n_alSynNew(ALSynConfig *c)
+@@ -147,6 +150,10 @@ Acmd *n_alAudioFrame(Acmd *cmdList, s32 *cmdLen, s16 *outBuf, s32 outLen)
+ 
+ 		cmdlEnd = n_alSavePull(n_syn->curSamples, cmdPtr);
+ 
++
++#ifdef __3DS__
++ native_dsp_mix_advance(nOut);
++#endif
+ 		outLen -= nOut;
+ 		lOutBuf += nOut << 1;     /* For Stereo */
+ 		n_syn->curSamples += nOut;
+diff --git a/src/lib/vi.c b/src/lib/vi.c
+index 884ee8d..e84dbbf 100644
+--- a/src/lib/vi.c
++++ b/src/lib/vi.c
+@@ -1,3 +1,6 @@
++#ifdef __3DS__
++#include "pd_runtime.h"
++#endif
+ #include <ultra64.h>
+ #include "constants.h"
+ #include "game/tex.h"
+@@ -902,6 +905,9 @@ f32 viGetFovY(void)
+ 
+ void viSetZRange(f32 near, f32 far)
+ {
++#ifdef __3DS__
++ far=pd_adjust_far(near,far);
++#endif
+ 	g_ViBackData->znear = near;
+ 	g_ViBackData->zfar = far;
+ 

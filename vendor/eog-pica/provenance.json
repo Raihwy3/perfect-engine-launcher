@@ -1,0 +1,164 @@
+{
+  "source_project": "Eyes of Gold native port",
+  "source_build": "c14c5d65fa49",
+  "upstream_revision": "fda76b69837e6c5aae436e0d3e798989e49b06d2",
+  "files": {
+    "vendor/eog-pica/src/display_3ds.c": {
+      "source": "native-engine/src/display_3ds.c",
+      "sha256": "0c4a4381c26beec04fec5b3808a0af0ce764fb6b6ee788e45adac7847a98d6f5"
+    },
+    "vendor/eog-pica/src/gfx_pica.cpp": {
+      "source": "native-engine/src/gfx_pica.cpp",
+      "sha256": "e248e5a4b41d2bf6e3ac8b4a3666df1fe631a8c51a959e9dd6f97b32a6d803d1"
+    },
+    "vendor/eog-pica/include/native_bottom.h": {
+      "source": "native-engine/include/native_bottom.h",
+      "sha256": "f13f604fbb6a271f313e143622c09a53d5fde8004a7d0c975add9b52cd288d1e"
+    },
+    "vendor/eog-pica/include/native_cart.h": {
+      "source": "native-engine/include/native_cart.h",
+      "sha256": "adfd188f2d1242c421b775cf7cf4cdb3f8404537bd31e8a0ed52ba337175e115"
+    },
+    "vendor/eog-pica/include/native_display.h": {
+      "source": "native-engine/include/native_display.h",
+      "sha256": "653982071de9c3c5e74924e16c82ed72218a0dfe08246bafec60d65f29ce3fe1"
+    },
+    "vendor/eog-pica/include/native_gpu_world.h": {
+      "source": "native-engine/include/native_gpu_world.h",
+      "sha256": "51adf1cea5254330319a0cd98d8bb86d30f6f01a96554a1fb5a1b28a0dc9b56b"
+    },
+    "vendor/eog-pica/include/native_graphics.h": {
+      "source": "native-engine/include/native_graphics.h",
+      "sha256": "b191328feeaebf47c1b900d500e3f7f1f7d04f6400edc735334b7bbbaf764368"
+    },
+    "vendor/eog-pica/include/native_retained_index.h": {
+      "source": "native-engine/include/native_retained_index.h",
+      "sha256": "17a1b0fcf210e444cadefcf2675d55858f55f2197b188b2ab63137c0c15506a2"
+    },
+    "vendor/eog-pica/include/native_rsp_profile.h": {
+      "source": "native-engine/include/native_rsp_profile.h",
+      "sha256": "0cc6cd26a0e79b0563f1296dc7cf78659c941c5d02b399efeccb2431323f45c4"
+    },
+    "vendor/eog-pica/include/native_settings.h": {
+      "source": "native-engine/include/native_settings.h",
+      "sha256": "9e5e08514b0355c96154296e0994b1d16171b140ccb82503dc8a523528e293d5"
+    },
+    "vendor/eog-pica/include/native_theme.h": {
+      "source": "native-engine/include/native_theme.h",
+      "sha256": "648581e71de9d79615bd5e504ce129e99e672291fc6ff53579b39d5234514b7d"
+    },
+    "vendor/eog-pica/include/native_vignette.h": {
+      "source": "native-engine/include/native_vignette.h",
+      "sha256": "86451d3e4286a03d6b6e2ef715af11e8dea4a40954ad37993be1f3e098fa69ac"
+    },
+    "vendor/eog-pica/include/native_watch_mirror.h": {
+      "source": "native-engine/include/native_watch_mirror.h",
+      "sha256": "6629038f09d9f8573ff1ab3cc32f89de5880c2bb4ceb8a8d94cc7f3dff81aa70"
+    },
+    "vendor/eog-pica/include/native_work_profile.h": {
+      "source": "native-engine/include/native_work_profile.h",
+      "sha256": "3a6c5b97251ed7a460cf02bd919bf82759bbf51648f409084dfa60d740730fb9"
+    },
+    "vendor/eog-pica/include/pica_alpha_product.h": {
+      "source": "native-engine/include/pica_alpha_product.h",
+      "sha256": "c0f144052523dc32d66411237a6ac12915dd4eb26de760adf587afb67f6d0236"
+    },
+    "vendor/eog-pica/include/pica_batch.h": {
+      "source": "native-engine/include/pica_batch.h",
+      "sha256": "a5ca5ac2413608184f02b3d242cf015520bcb948260f4ec105879efa060db5ae"
+    },
+    "vendor/eog-pica/include/pica_combiner.h": {
+      "source": "native-engine/include/pica_combiner.h",
+      "sha256": "c8ac8cb2af6f815d3daf0b258cbbd57aef4bc74f49d63494aa14061c5b15112a"
+    },
+    "vendor/eog-pica/include/pica_decal_depth.h": {
+      "source": "native-engine/include/pica_decal_depth.h",
+      "sha256": "bf97d0fea377f5c679f9fb4c9300d7e5bbbe2801e48e51eb3f61abea3f0fa4fd"
+    },
+    "vendor/eog-pica/include/pica_depth.h": {
+      "source": "native-engine/include/pica_depth.h",
+      "sha256": "c14ccfdd647810689264fa070654372d1c90da62ed31f32c2cd6d428f1ec8eed"
+    },
+    "vendor/eog-pica/include/pica_fog.h": {
+      "source": "native-engine/include/pica_fog.h",
+      "sha256": "d983d5f9a4befe9a9e74348a6cfba20f18e5db1a6cc111106482f3a0c5800286"
+    },
+    "vendor/eog-pica/src/pica_inputs.cpp": {
+      "source": "native-engine/src/pica_inputs.cpp",
+      "sha256": "2ee2dad07bb5212d8d880c712dc6ecf4e36db36e663bdc8822d210b0caabc691"
+    },
+    "vendor/eog-pica/include/pica_inputs.h": {
+      "source": "native-engine/include/pica_inputs.h",
+      "sha256": "09dd6542c7548dbcd7e2e3ec03f424a44fa2e44bd2498b71149e8f7e1f081062"
+    },
+    "vendor/eog-pica/include/pica_lod_inputs.h": {
+      "source": "native-engine/include/pica_lod_inputs.h",
+      "sha256": "37673b6b435bcee28c6de39a807e0cb3ff04b350c5942b95f9d03aa1c3c50e99"
+    },
+    "vendor/eog-pica/include/pica_mesh_cache.h": {
+      "source": "native-engine/include/pica_mesh_cache.h",
+      "sha256": "f3cb3864f48ad89db974b36e4db9a25a7e209dc3062455fe89587d03fe54421e"
+    },
+    "vendor/eog-pica/include/pica_noise.h": {
+      "source": "native-engine/include/pica_noise.h",
+      "sha256": "0fdd780da7deb4ad5d9cccc5757f0bd6d0aa4fd0ef81b3a1a9844ad85809b8e9"
+    },
+    "vendor/eog-pica/include/pica_proven_inputs.h": {
+      "source": "native-engine/include/pica_proven_inputs.h",
+      "sha256": "83a205972f054c36933d0cbbcffe58a82ec650167fca5b5d11902a0d0dddf5a9"
+    },
+    "vendor/eog-pica/include/pica_retained_mesh.h": {
+      "source": "native-engine/include/pica_retained_mesh.h",
+      "sha256": "8b83a71e1c341c6dcb7eb538bf2c5de80dc28161dc7189168fa188b3b07e68f5"
+    },
+    "vendor/eog-pica/include/pica_sharpness.h": {
+      "source": "native-engine/include/pica_sharpness.h",
+      "sha256": "1d96473503a50e548980ef2009f0b224bf474a009b178383263322af21eb892d"
+    },
+    "vendor/eog-pica/include/pica_static_attributes.h": {
+      "source": "native-engine/include/pica_static_attributes.h",
+      "sha256": "d2d0cbea0a123db98bdd9dbbaff09b68dfe13899c79453bae88542445526d446"
+    },
+    "vendor/eog-pica/include/pica_tev_cache.h": {
+      "source": "native-engine/include/pica_tev_cache.h",
+      "sha256": "cb4be23869695d382bb1efa2ea16cd90b10442bd820c49f29bc11d0707867691"
+    },
+    "vendor/eog-pica/include/pica_texcoord.h": {
+      "source": "native-engine/include/pica_texcoord.h",
+      "sha256": "ac116bef091403a4e397af4839b7a37f673fa2340504c8e6cbee10ce78943aaa"
+    },
+    "vendor/eog-pica/include/pica_watch_mirror.h": {
+      "source": "native-engine/include/pica_watch_mirror.h",
+      "sha256": "cce8125d85ae9ac259eb041f0b2208559ea0e2779cedd0a9aa04fa524ab7883e"
+    },
+    "vendor/eog-pica/src/native_clip.v.pica": {
+      "source": "native-engine/src/native_clip.v.pica",
+      "sha256": "d9c8566cd2cd366c20bc9b9e7a59368e0c127c574abd8b328d1aae7f63c66a88"
+    },
+    "vendor/eog-pica/src/native_world.v.pica": {
+      "source": "native-engine/src/native_world.v.pica",
+      "sha256": "8c544bfc163be7cbcf4b6c8288e62902ddeebfa85b90f02b5de218e2a4c3b1c7"
+    },
+    "vendor/eog-pica/include/gfx_cc.h": {
+      "source": "upstream/goldeneye-pc/port/fast3d/gfx_cc.h",
+      "sha256": "83058e604ada593260cf0b258839f4939952aa5ba0b7a0e509583b4224a6304e"
+    },
+    "vendor/eog-pica/src/gfx_cc.cpp": {
+      "source": "upstream/goldeneye-pc/port/fast3d/gfx_cc.cpp",
+      "sha256": "ffd16664afd6bb5647b2936ad255b454eeaf78ef87eb768536e0dcf4119d76c4"
+    },
+    "vendor/eog-pica/include/gfx_rendering_api.h": {
+      "source": "upstream/goldeneye-pc/port/fast3d/gfx_rendering_api.h",
+      "sha256": "303356a7e307b06b8b4177cb3c456c32a0a9a82e93f0be20d94ee59980e4e88b"
+    },
+    "vendor/eog-pica/include/gfx_window_manager_api.h": {
+      "source": "upstream/goldeneye-pc/port/fast3d/gfx_window_manager_api.h",
+      "sha256": "f92d71354b4f91e51933ce2ec858522764c04daf61dd2bd39d60176cb8f352f0"
+    }
+  },
+  "native_transfer": {
+    "source_project": "Eyes of Gold Launcher",
+    "revision": "41485d9371397b0faf155b09ea4015fef8f2a58a",
+    "scope": "Selected command-buffer, gyro, flick, convergence and ghost-reduction changes adapted to Perfect Dark; original provenance below remains the baseline."
+  }
+}

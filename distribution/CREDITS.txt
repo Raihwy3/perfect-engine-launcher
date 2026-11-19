@@ -1,0 +1,61 @@
+Perfect Engine Launcher — credits
+
+Engine
+Ryan Dwyer and the Perfect Dark decompilation contributors, and the Perfect Dark
+PC port contributors. The pinned engine source is MIT licensed; the Fast3D
+renderer retains its separate notices.
+Decompilation: https://github.com/n64decomp/perfect_dark
+PC port: https://github.com/perfect-dark-pc-port/perfect_dark
+
+Eyes of Gold
+Raihwy3 and Eyes of Gold contributors: the PICA/Citro3D renderer, platform
+adapters, DSP/audio queue work, stereo depth controls, touchscreen/menu tools,
+gyro and flick-stick integration, crosshair controls and launcher updater.
+The adapted sources keep their MIT notices. The Eyes of Gold code also builds
+on the GoldenEye PC port and Fast3D work credited in the renderer notices.
+https://github.com/Raihwy3/eyes-of-gold
+https://github.com/jkdansereau/goldeneye-pc-port
+
+Motion controls
+Julian "Jibb" Smart and contributors: GamepadMotionHelpers for motion fusion,
+orientation spaces and calibration; JoyShockMapper for adapted flick-stick
+timing and rotation smoothing. Both MIT licenses are included.
+https://github.com/JibbSmart/GamepadMotionHelpers
+https://github.com/JibbSmart/JoyShockMapper
+
+Stereoscopic rendering
+OneUp (oneup03) and RT64 contributors: dynamic3d guidance and stereo depth /
+convergence calculations adapted from rt64-3ds. The RT64 MIT license is included.
+This port uses a separate PICA renderer.
+https://github.com/oneup03/3D-Skills/tree/main/dynamic3d
+https://github.com/oneup03/rt64-3ds
+
+Updater
+Adapted from Eyes of Gold. Uses curl, Mbed TLS, zlib/minizip and Serge Zaitsev's
+jsmn parser. The embedded trust store is Mozilla's root certificate collection,
+distributed through curl's CA extract. Original notices and licenses are included.
+https://curl.se/
+https://github.com/Mbed-TLS/mbedtls
+https://zlib.net/
+https://github.com/zserge/jsmn
+https://curl.se/docs/caextract.html
+
+Tools and runtime
+The devkitPro contributors: devkitARM, libctru, Citro3D, picasso, smdhtool and
+3dsxtool. GCC and newlib provide compiler/runtime support. Their applicable
+runtime licenses and the GCC Runtime Library Exception are included.
+Mark Adler: the public-domain inflate core; its provenance comments remain in
+vendor/public-domain-inflate. The original launcher icon is drawn by
+ tools/make_launcher_icon.py (optional Pillow dependency).
+https://devkitpro.org/
+https://github.com/devkitPro/libctru
+https://github.com/devkitPro/citro3d
+
+Thanks
+IDrinkLava on GBAtemp for gyro feedback and reference suggestions, and OneUp
+on GBAtemp for stereo guidance. Thanks to the players testing these ports.
+
+Original game content is supplied by the user's ROM. Game content and branding
+belong to their respective owners; the source licenses cover the listed code.
+
+Disclosure: AI tools were used during the development and organization of this project.
